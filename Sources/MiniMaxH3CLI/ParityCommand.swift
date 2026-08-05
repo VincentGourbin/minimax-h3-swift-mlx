@@ -25,6 +25,9 @@ struct ParityCommand: AsyncParsableCommand {
     @Option(name: .long, help: "Max tolerated max-abs-error.")
     var tolerance: Float = 5e-3
 
+    @Option(name: .long, help: "Quantization for dit-block0 (degradation probe): none | qint8 | qint6 | int4.")
+    var quant: String = "none"
+
     func run() async throws {
         H3Debug.isEnabled = true
         let directory = URL(fileURLWithPath: modelsDir)
@@ -48,7 +51,9 @@ struct ParityCommand: AsyncParsableCommand {
         case "dit-block0":
             let reference = try loadArrays(
                 url: parityDir.appendingPathComponent("dit_block0.safetensors"))
-            let transformer = try H3WeightLoader.loadTransformer(modelDirectory: directory, numLayers: 1)
+            let transformer = try H3WeightLoader.loadTransformer(
+                modelDirectory: directory, numLayers: 1,
+                quantization: H3Quantization(rawValue: quant) ?? .none)
             let layout = try H3Packing.buildPackedSequence(
                 textTokenTags: [1, 1, 1, 1],
                 numLatentFrames: 2, latentHeight: 4, latentWidth: 4,

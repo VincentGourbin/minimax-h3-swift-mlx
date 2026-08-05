@@ -26,6 +26,10 @@ public struct H3GenerationRequest: Sendable {
     public var audioFlowShift: Float = 3.0
     /// Skip the 5-15 s duration check (frames still snapped to 17n+5) — smoke tests only.
     public var allowShortVideo = false
+    /// On-the-fly quantization of the 33B transformer.
+    public var transformerQuantization: H3Quantization = .none
+    /// On-the-fly quantization of the Qwen3-VL conditioner.
+    public var textEncoderQuantization: H3Quantization = .none
 
     public init(prompt: String) { self.prompt = prompt }
 }
@@ -55,7 +59,9 @@ public final class H3Pipeline {
     // MARK: - Stage 1: text encoding
 
     /// Encode the t2va presentation: the verbatim prompt, no chat template, no special tokens.
-    func encodePrompt(_ prompt: String) async throws -> (embeds: MLXArray, tags: [Int32]) {
+    func encodePrompt(
+        _ prompt: String, quantization: H3Quantization
+    ) async throws -> (embeds: MLXArray, tags: [Int32]) {
         let profiler = H3Profiler.shared
         report("Loading tokenizer")
         profiler.start("Tokenization")
@@ -68,7 +74,8 @@ public final class H3Pipeline {
 
         report("Loading text encoder (Qwen3-VL-32B, layers 0-49)")
         profiler.start("Load Text Encoder")
-        let encoder = try H3WeightLoader.loadTextEncoder(modelDirectory: modelDirectory)
+        let encoder = try H3WeightLoader.loadTextEncoder(
+            modelDirectory: modelDirectory, quantization: quantization)
         profiler.end("Load Text Encoder")
 
         report("Encoding prompt (\(tokenIds.count) tokens)")
@@ -111,7 +118,8 @@ public final class H3Pipeline {
                 + "\(audioLatents) audio latents/channel")
 
         // 2. Text conditioning, then free the encoder before anything big loads.
-        let (promptEmbeds, textTags) = try await encodePrompt(request.prompt)
+        let (promptEmbeds, textTags) = try await encodePrompt(
+            request.prompt, quantization: request.textEncoderQuantization)
         Memory.clearCache()
 
         // 3. Packed layout and schedules.
@@ -143,7 +151,8 @@ public final class H3Pipeline {
         let profiler = H3Profiler.shared
         report("Loading transformer (61.7 GB)")
         profiler.start("Load Transformer")
-        var transformer: H3Transformer? = try H3WeightLoader.loadTransformer(modelDirectory: modelDirectory)
+        var transformer: H3Transformer? = try H3WeightLoader.loadTransformer(
+            modelDirectory: modelDirectory, quantization: request.transformerQuantization)
         Memory.clearCache()
         profiler.end("Load Transformer")
 

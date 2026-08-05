@@ -36,8 +36,15 @@ Details and prompts in [docs/examples/t2va](docs/examples/t2va/README.md).
   (~17.4k tokens — attention is ~75 % of a step at that length)
 - Weight loads: ~2 min 20 total from external USB SSD (profiled; quantization will cut this)
 
+**Quantization** (`--transformer-quant` / `--text-encoder-quant`, qint8/qint6/int4, MiniMax's
+official module exclusions; `export-quantized` writes reusable prequantized checkpoints that
+loaders pick up automatically):
+- Prequantized qint8 text encoder: **load 55.7 s → 2.6 s**, file 52 → 27.5 GB, output identical
+- Quantized full pipeline: peak memory 63 → 34 GB, but MLX quantized matmuls are markedly slower
+  than bf16 GEMMs at DiT sequence lengths — on 96 GB the recommended config is prequantized
+  qint8 text encoder + full-precision transformer
+
 **Not yet:**
-- Quantization (on-the-fly + prequantized export) — next up
 - fl2va (first/last keyframe): needs the Qwen3-VL vision tower + the causal video VAE encoder
 - ref2va, and the hosted-only H3-Context-IR / H3-Regenerate-2K stages
 - MiniMax's sparse attention (not yet open-sourced) — the real unlock for full 768p speed
@@ -82,6 +89,10 @@ minimax-h3 generate "A red fox trotting through a snowy pine forest, snow crunch
 # Smaller canvas = much faster per step (multiples of 32). Short edge 768 is the trained
 # regime; smaller trades quality (and ~6 dB of audio level) for speed.
 minimax-h3 generate "..." -W 960 -H 544 -s 30 -o fast.mp4 --profile
+
+# One-time: export a prequantized text encoder, then every run loads it in seconds
+minimax-h3 export-quantized text-encoder --quant qint8
+minimax-h3 generate "..." --text-encoder-quant qint8 -o out.mp4
 
 # Rebuild an MP4 from a saved raw result (written automatically before every mux)
 minimax-h3 mux fox.raw.safetensors -o fox2.mp4 --normalize-audio

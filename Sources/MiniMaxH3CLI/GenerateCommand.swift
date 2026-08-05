@@ -39,6 +39,12 @@ struct GenerateCommand: AsyncParsableCommand {
     @Option(name: .long, help: "Audio flow shift.")
     var audioFlowShift: Float = 3.0
 
+    @Option(name: .long, help: "Transformer quantization: none | qint8 | qint6 | int4.")
+    var transformerQuant: String = "none"
+
+    @Option(name: .long, help: "Text encoder quantization: none | qint8 | qint6 | int4.")
+    var textEncoderQuant: String = "none"
+
     @Option(name: .long, help: "Model directory (diffusers layout).")
     var modelsDir: String = defaultModelsDirectory()
 
@@ -65,6 +71,7 @@ struct GenerateCommand: AsyncParsableCommand {
             profilingSession.metadata["frames"] = "\(frames)"
             profilingSession.metadata["steps"] = "\(steps)"
             profilingSession.metadata["seed"] = "\(seed)"
+            profilingSession.metadata["quant"] = "\(transformerQuant)/\(textEncoderQuant)"
             H3Profiler.shared.enable()
             H3Profiler.shared.activeSession = profilingSession
             session = profilingSession
@@ -85,6 +92,13 @@ struct GenerateCommand: AsyncParsableCommand {
         request.flowShift = flowShift
         request.audioFlowShift = audioFlowShift
         request.allowShortVideo = allowShortVideo
+        guard let transformerQuantization = H3Quantization(rawValue: transformerQuant),
+              let textEncoderQuantization = H3Quantization(rawValue: textEncoderQuant) else {
+            throw ValidationError("Quantization must be one of: "
+                + H3Quantization.allCases.map(\.rawValue).joined(separator: ", "))
+        }
+        request.transformerQuantization = transformerQuantization
+        request.textEncoderQuantization = textEncoderQuantization
 
         let pipeline = H3Pipeline(modelDirectory: URL(fileURLWithPath: modelsDir))
         pipeline.progressHandler = { phase, step, total in

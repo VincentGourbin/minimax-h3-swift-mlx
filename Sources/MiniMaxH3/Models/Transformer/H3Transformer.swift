@@ -184,6 +184,13 @@ final class H3FeedForward: Module {
     }
 }
 
+/// Compute dtype of a possibly-quantized Linear: a QuantizedLinear's `weight` is the packed
+/// uint32 tensor — casting activations to it corrupts them; its `scales` carry the real dtype.
+@inline(__always)
+func computeDType(_ linear: Linear) -> DType {
+    (linear as? QuantizedLinear)?.scales.dtype ?? linear.weight.dtype
+}
+
 // MARK: - Timestep embedding
 
 /// Sinusoidal embedding (flip_sin_to_cos=true, downscale_freq_shift=0) + MLP 256 -> 5376 -> 2688.
@@ -206,7 +213,7 @@ final class H3TimeEmbedder: Module {
         let angles = timesteps.asType(.float32).expandedDimensions(axis: -1) * exp(exponent)
         // flip_sin_to_cos: [cos | sin]
         let embedding = concatenated([cos(angles), sin(angles)], axis: -1)
-        return linear2(silu(linear1(embedding.asType(linear1.weight.dtype))))
+        return linear2(silu(linear1(embedding.asType(computeDType(linear1)))))
     }
 }
 
@@ -230,7 +237,7 @@ final class H3AdaLNModulation: Module {
 
     /// temb (T, timeEmbedDim) fp32 -> six tensors (T * 3, hiddenSize).
     func callAsFunction(_ temb: MLXArray) -> [MLXArray] {
-        let projected = linear(silu(temb).asType(linear.weight.dtype))
+        let projected = linear(silu(temb).asType(computeDType(linear)))
         return projected.reshaped(-1, 6 * hiddenSize).split(parts: 6, axis: -1)
     }
 }
@@ -248,7 +255,7 @@ final class H3AdaLNOut: Module {
 
     /// x (B, seq, hidden); temb (T, timeEmbedDim) fp32; timestepIndices (seq,) int32.
     func callAsFunction(_ x: MLXArray, temb: MLXArray, timestepIndices: MLXArray) -> MLXArray {
-        let projected = linear(silu(temb).asType(linear.weight.dtype))
+        let projected = linear(silu(temb).asType(computeDType(linear)))
         let split = projected.split(parts: 2, axis: -1)
         let shift = split[0].take(timestepIndices, axis: 0)
         let scale = split[1].take(timestepIndices, axis: 0)
@@ -406,9 +413,9 @@ public final class H3Transformer: Module {
 
         // 1. Per-modality projections; the text stream sets the packed sequence's dtype (bf16).
         // proj_in / audio_proj_in are float32 modules, context_embedder is bf16.
-        let videoEmbeds = projIn(videoRows.asType(projIn.weight.dtype))
-        let audioEmbeds = audioProjIn(audioRows.asType(audioProjIn.weight.dtype))
-        var textStream = contextEmbedder(textEmbeds.asType(contextEmbedder.weight.dtype))
+        let videoEmbeds = projIn(videoRows.asType(computeDType(projIn)))
+        let audioEmbeds = audioProjIn(audioRows.asType(computeDType(audioProjIn)))
+        var textStream = contextEmbedder(textEmbeds.asType(computeDType(contextEmbedder)))
         textStream = tokenRefiner(textStream)
         let streamType = textStream.dtype
 
@@ -435,7 +442,7 @@ public final class H3Transformer: Module {
         // 5. Output norm (indexed per row by timestep), then both float32 heads over every row;
         // rows of each modality selected after, by the contiguous layout.
         x = normOut(x, temb: temb, timestepIndices: timestepIndices)
-        x = x.asType(projOut.weight.dtype)
+        x = x.asType(computeDType(projOut))
         let videoOut = projOut(x)[0]
         let audioOut = audioProjOut(x)[0]
 

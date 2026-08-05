@@ -18,6 +18,9 @@ struct SmokeCommand: AsyncParsableCommand {
     @Option(name: .long, help: "Model directory (diffusers layout).")
     var modelsDir: String = defaultModelsDirectory()
 
+    @Option(name: .long, help: "Quantization probe: none | qint8 | qint6 | int4.")
+    var quant: String = "none"
+
     func run() async throws {
         H3Debug.isEnabled = true
         let directory = URL(fileURLWithPath: modelsDir)
@@ -75,7 +78,10 @@ struct SmokeCommand: AsyncParsableCommand {
     private func smokeTextEncoder(_ directory: URL) async throws {
         print("→ text encoder: loading ~52 GB (layers 0-49)…")
         let start = Date()
-        let encoder = try H3WeightLoader.loadTextEncoder(modelDirectory: directory)
+        let encoder = try H3WeightLoader.loadTextEncoder(
+            modelDirectory: directory,
+            quantization: H3Quantization(rawValue: quant) ?? .none,
+            skipPrequantizedPickup: true)
         print(String(format: "  loaded in %.1f s", Date().timeIntervalSince(start)))
         let ids = MLXArray([Int32](arrayLiteral: 3838, 374, 264, 1273)).expandedDimensions(axis: 0)
         let hidden = encoder(ids)

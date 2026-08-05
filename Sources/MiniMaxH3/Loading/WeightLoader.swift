@@ -74,12 +74,37 @@ public enum H3WeightLoader {
 
     /// Load the H3 transformer from `<modelDir>/transformer`. Checkpoint dtypes are kept as-is
     /// (mixed bf16 / fp32 — the fp32 modules are part of the checkpoint contract).
-    /// - Parameter numLayers: block count to materialize (parity harnesses use 1; nil = all).
-    public static func loadTransformer(modelDirectory: URL, numLayers: Int? = nil) throws -> H3Transformer {
+    /// - Parameters:
+    ///   - numLayers: block count to materialize (parity harnesses use 1; nil = all).
+    ///   - quantization: on-the-fly quantization applied after the weights land (MiniMax's
+    ///     exclusion list keeps the fp32 modules, refiner and output norm at full precision).
+    public static func loadTransformer(
+        modelDirectory: URL,
+        numLayers: Int? = nil,
+        quantization: H3Quantization = .none,
+        skipPrequantizedPickup: Bool = false
+    ) throws -> H3Transformer {
         let directory = modelDirectory.appendingPathComponent("transformer")
         var config = try H3TransformerConfig.load(from: directory.appendingPathComponent("config.json"))
         if let numLayers { config.numLayers = numLayers }
         let model = H3Transformer(config: config)
+
+        // Prequantized fast path: quantize the (lazy) structure with the same filter, then load
+        // the exported parameters — reads ~18.5 GB instead of 62 at qint8.
+        if !skipPrequantizedPickup, numLayers == nil,
+           H3PrequantizedCheckpoint.exists(
+               modelDirectory: modelDirectory, component: "transformer", quantization: quantization) {
+            H3QuantizationFilter.apply(
+                quantization, to: model, exclusions: H3QuantizationFilter.transformerExclusions)
+            try H3PrequantizedCheckpoint.load(
+                into: model,
+                from: H3PrequantizedCheckpoint.url(
+                    modelDirectory: modelDirectory, component: "transformer", quantization: quantization),
+                component: "transformer",
+                quantization: quantization
+            )
+            return model
+        }
 
         let weights = try loadShardedWeights(directory: directory) { key in
             if let numLayers, key.hasPrefix("transformer_blocks.") {
@@ -93,6 +118,13 @@ public enum H3WeightLoader {
                 .replacingOccurrences(of: ".ff.net.2.", with: ".ff.out.")
         }
         try apply(weights: weights, to: model, component: "transformer")
+        if quantization != .none {
+            H3QuantizationFilter.apply(
+                quantization, to: model, exclusions: H3QuantizationFilter.transformerExclusions)
+            eval(model.parameters())
+            Memory.clearCache()
+            H3Debug.log("transformer quantized: \(quantization.displayName)")
+        }
         return model
     }
 
@@ -102,11 +134,27 @@ public enum H3WeightLoader {
     /// embeddings only. Vision tower, layers 50..<64, final norm and LM head are skipped.
     public static func loadTextEncoder(
         modelDirectory: URL,
-        numLayers: Int = H3Constants.textEncoderLayer
+        numLayers: Int = H3Constants.textEncoderLayer,
+        quantization: H3Quantization = .none,
+        skipPrequantizedPickup: Bool = false
     ) throws -> Qwen3VLTextEncoder {
         let directory = modelDirectory.appendingPathComponent("text_encoder")
         let config = try Qwen3VLTextConfig.load(from: directory.appendingPathComponent("config.json"))
         let model = Qwen3VLTextEncoder(config: config, numLayers: numLayers)
+
+        if !skipPrequantizedPickup, numLayers == H3Constants.textEncoderLayer,
+           H3PrequantizedCheckpoint.exists(
+               modelDirectory: modelDirectory, component: "text_encoder", quantization: quantization) {
+            H3QuantizationFilter.apply(quantization, to: model, exclusions: [])
+            try H3PrequantizedCheckpoint.load(
+                into: model,
+                from: H3PrequantizedCheckpoint.url(
+                    modelDirectory: modelDirectory, component: "text_encoder", quantization: quantization),
+                component: "text_encoder",
+                quantization: quantization
+            )
+            return model
+        }
 
         let prefix = "model.language_model."
         let weights = try loadShardedWeights(directory: directory) { key in
@@ -120,6 +168,14 @@ public enum H3WeightLoader {
             return stripped
         }
         try apply(weights: weights, to: model, component: "text_encoder")
+        if quantization != .none {
+            // Only Linear layers are quantized — embed_tokens (Embedding) stays full precision,
+            // matching MiniMax's text-encoder exclusions.
+            H3QuantizationFilter.apply(quantization, to: model, exclusions: [])
+            eval(model.parameters())
+            Memory.clearCache()
+            H3Debug.log("text_encoder quantized: \(quantization.displayName)")
+        }
         return model
     }
 }
