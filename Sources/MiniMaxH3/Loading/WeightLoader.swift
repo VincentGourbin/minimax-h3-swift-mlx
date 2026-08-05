@@ -1,0 +1,125 @@
+// WeightLoader.swift - Sharded safetensors loading with key remapping and diagnostics
+// Copyright 2026 Vincent Gourbin
+//
+// Loads diffusers-layout checkpoints from a local model directory. Arrays from
+// `loadArrays` are lazy/memory-mapped; we
+// materialize them with an explicit eval after the update so the denoising loop never faults
+// pages back in from the external SSD.
+
+import Foundation
+import MLX
+import MLXNN
+
+public enum H3WeightLoader {
+    // MARK: - Generic sharded loading
+
+    /// Load every `*.safetensors` in a directory, remap keys, and return the merged dictionary.
+    /// Keys for which `remap` returns nil are dropped (dead weight, e.g. truncated layers).
+    static func loadShardedWeights(
+        directory: URL,
+        remap: (String) -> String?
+    ) throws -> [String: MLXArray] {
+        let shards = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+            .filter { $0.pathExtension == "safetensors" }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+        guard !shards.isEmpty else {
+            throw H3Error.modelNotFound("No .safetensors shards in \(directory.path)")
+        }
+
+        var merged = [String: MLXArray]()
+        for shard in shards {
+            let arrays = try loadArrays(url: shard)
+            for (key, value) in arrays {
+                guard let mappedKey = remap(key) else { continue }
+                merged[mappedKey] = value
+            }
+        }
+        return merged
+    }
+
+    /// Apply weights to a module and report both directions of key mismatch.
+    /// - Parameter allowMissing: model parameter key prefixes that may legitimately stay
+    ///   at their initialized values (must be empty for H3 components — every key must load).
+    static func apply(
+        weights: [String: MLXArray],
+        to model: Module,
+        component: String,
+        allowMissing: [String] = []
+    ) throws {
+        let modelKeys = Set(model.parameters().flattened().map(\.0))
+        let weightKeys = Set(weights.keys)
+
+        let missing = modelKeys.subtracting(weightKeys)
+            .filter { key in !allowMissing.contains { key.hasPrefix($0) } }
+        let unused = weightKeys.subtracting(modelKeys)
+        guard missing.isEmpty else {
+            throw H3Error.weightLoadingFailed(
+                "\(component): \(missing.count) parameters have no checkpoint tensor, e.g. "
+                    + missing.sorted().prefix(5).joined(separator: ", ")
+            )
+        }
+        guard unused.isEmpty else {
+            throw H3Error.weightLoadingFailed(
+                "\(component): \(unused.count) checkpoint tensors matched no parameter, e.g. "
+                    + unused.sorted().prefix(5).joined(separator: ", ")
+            )
+        }
+
+        model.update(parameters: ModuleParameters.unflattened(weights))
+        eval(model.parameters())
+        H3Debug.log("\(component): loaded \(weights.count) tensors")
+    }
+
+    // MARK: - Transformer
+
+    /// Load the H3 transformer from `<modelDir>/transformer`. Checkpoint dtypes are kept as-is
+    /// (mixed bf16 / fp32 — the fp32 modules are part of the checkpoint contract).
+    /// - Parameter numLayers: block count to materialize (parity harnesses use 1; nil = all).
+    public static func loadTransformer(modelDirectory: URL, numLayers: Int? = nil) throws -> H3Transformer {
+        let directory = modelDirectory.appendingPathComponent("transformer")
+        var config = try H3TransformerConfig.load(from: directory.appendingPathComponent("config.json"))
+        if let numLayers { config.numLayers = numLayers }
+        let model = H3Transformer(config: config)
+
+        let weights = try loadShardedWeights(directory: directory) { key in
+            if let numLayers, key.hasPrefix("transformer_blocks.") {
+                let layerIndex = Int(key.split(separator: ".")[1]) ?? .max
+                guard layerIndex < numLayers else { return nil }
+            }
+            // diffusers module names -> our @ModuleInfo keys.
+            return key
+                .replacingOccurrences(of: ".to_out.0.", with: ".to_out.")
+                .replacingOccurrences(of: ".ff.net.0.proj.", with: ".ff.proj.")
+                .replacingOccurrences(of: ".ff.net.2.", with: ".ff.out.")
+        }
+        try apply(weights: weights, to: model, component: "transformer")
+        return model
+    }
+
+    // MARK: - Text encoder
+
+    /// Load the truncated Qwen3-VL conditioner from `<modelDir>/text_encoder`: layers 0..<50,
+    /// embeddings only. Vision tower, layers 50..<64, final norm and LM head are skipped.
+    public static func loadTextEncoder(
+        modelDirectory: URL,
+        numLayers: Int = H3Constants.textEncoderLayer
+    ) throws -> Qwen3VLTextEncoder {
+        let directory = modelDirectory.appendingPathComponent("text_encoder")
+        let config = try Qwen3VLTextConfig.load(from: directory.appendingPathComponent("config.json"))
+        let model = Qwen3VLTextEncoder(config: config, numLayers: numLayers)
+
+        let prefix = "model.language_model."
+        let weights = try loadShardedWeights(directory: directory) { key in
+            guard key.hasPrefix(prefix) else { return nil }  // drops lm_head + model.visual.*
+            let stripped = String(key.dropFirst(prefix.count))
+            if stripped == "norm.weight" { return nil }  // final norm: H3 reads pre-norm states
+            if stripped.hasPrefix("layers.") {
+                let layerIndex = Int(stripped.split(separator: ".")[1]) ?? .max
+                guard layerIndex < numLayers else { return nil }
+            }
+            return stripped
+        }
+        try apply(weights: weights, to: model, component: "text_encoder")
+        return model
+    }
+}

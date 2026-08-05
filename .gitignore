@@ -1,0 +1,8 @@
+.build/
+.xcodebuild/
+.DS_Store
+*.profraw
+*.mp4
+!docs/examples/**/*.mp4
+*.raw.safetensors
+*.trace.json

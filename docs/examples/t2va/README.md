@@ -1,0 +1,25 @@
+# t2va examples
+
+Generated end-to-end on an Apple M3 Max (96 GB), full-precision bf16, strict sequential
+component loading. Audio and video come out of one joint denoising pass — no vocoder,
+no post-hoc audio.
+
+## 🦊 Fox in snow — [fox-snow-960x544.mp4](fox-snow-960x544.mp4)
+
+![fox frame](fox-frame.png)
+
+- **Prompt**: `A red fox trotting through a snowy pine forest, snow crunching underfoot`
+- 960×544, 124 frames (5.2 s @ 24 fps), 30 sigma points (29 evals), seed 42
+- ~2 h 10 denoising + ~25 min loads/decodes on M3 Max
+- Audio: soft snow-crunch footsteps + winter ambience, peak-normalized to −3 dBFS at mux
+  (H3 mixes at scene-faithful loudness: a quiet scene decodes quiet — see
+  `docs/knowledge/playbooks/context-ir-prompting.md`)
+
+## 🥁 Drum solo — [drum-solo-768x768.mp4](drum-solo-768x768.mp4)
+
+![drums frame](drums-frame.png)
+
+- **Prompt** (Context-IR style, abbreviated): aggressive rock drum solo, close-miked kit,
+  `overall_soundscape:` "deafening… pounding kick, cracking snare, loud crashing cymbals…"
+- 768×768, 39 frames (1.6 s), 30 sigma points, seed 7
+- Raw model mix peaks at 0 dBFS — loud scene, loud audio, no normalization needed
