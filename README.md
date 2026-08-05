@@ -39,10 +39,11 @@ Details and prompts in [docs/examples/t2va](docs/examples/t2va/README.md).
 **Quantization** (`--transformer-quant` / `--text-encoder-quant`, qint8/qint6/int4, MiniMax's
 official module exclusions; `export-quantized` writes reusable prequantized checkpoints that
 loaders pick up automatically):
-- Prequantized qint8 text encoder: **load 55.7 s → 2.6 s**, file 52 → 27.5 GB, output identical
-- Quantized full pipeline: peak memory 63 → 34 GB, but MLX quantized matmuls are markedly slower
-  than bf16 GEMMs at DiT sequence lengths — on 96 GB the recommended config is prequantized
-  qint8 text encoder + full-precision transformer
+- Prequantized qint8 text encoder: cold load 55.7 → 30 s (2.6 s warm), file 52 → 27.5 GB,
+  −25 GB resident, output identical
+- qint8 transformer: steps ~1.34× bf16 (idle benchmarks) for a 45 % peak-memory cut
+  (63 → 34 GB) — bf16 for speed, qint8 for memory headroom; prequantized files load without
+  re-reading the bf16 checkpoint
 
 **Not yet:**
 - fl2va (first/last keyframe): needs the Qwen3-VL vision tower + the causal video VAE encoder

@@ -104,10 +104,14 @@ def dump_text_layer0(models_dir: pathlib.Path) -> None:
     rotary = Qwen3VLTextRotaryEmbedding(config=config)
     position_ids = torch.arange(token_ids.shape[1])[None].expand(3, 1, -1)
     cos, sin = rotary(hidden, position_ids)
+    # A standalone decoder layer applies no causal mask on its own — build the additive 4D
+    # causal mask the full model would pass, or the reference computes bidirectional attention.
+    length = token_ids.shape[1]
+    causal = torch.triu(torch.full((length, length), float("-inf")), diagonal=1)[None, None]
     with torch.no_grad():
         out = layer(
             hidden,
-            attention_mask=None,
+            attention_mask=causal,
             position_embeddings=(cos, sin),
             position_ids=position_ids,
         )

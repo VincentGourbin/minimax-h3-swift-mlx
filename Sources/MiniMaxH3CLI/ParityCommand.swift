@@ -48,6 +48,16 @@ struct ParityCommand: AsyncParsableCommand {
             let ours = vae.decode(reference["latents"]!)
             try compare(ours: ours, reference: reference["video"]!, name: "video")
 
+        case "text-layer0":
+            // Embeddings + decoder layer 0 alone: catches RoPE/GQA/norm mistakes cheaply, and
+            // validates that text-only interleaved-mrope really collapses to standard RoPE.
+            let reference = try loadArrays(
+                url: parityDir.appendingPathComponent("text_layer0.safetensors"))
+            let encoder = try H3WeightLoader.loadTextEncoder(
+                modelDirectory: directory, numLayers: 1)
+            let hidden = encoder(reference["token_ids"]!.asType(.int32))
+            try compare(ours: hidden, reference: reference["layer0_out"]!, name: "layer0 hidden")
+
         case "dit-block0":
             let reference = try loadArrays(
                 url: parityDir.appendingPathComponent("dit_block0.safetensors"))

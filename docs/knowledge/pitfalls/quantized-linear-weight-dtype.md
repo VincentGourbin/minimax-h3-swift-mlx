@@ -22,10 +22,10 @@ linear.weight.dtype` — used for every activation cast keyed on a quantizable l
 **Verification**: `parity dit-block0 --quant qint8` — max|Δ| 1.41 vs 1.11 unquantized on a 260
 scale (qint8 adds almost nothing over bf16 noise).
 
-**Also measured**: MLX quantized matmuls are substantially slower than bf16 GEMMs at DiT
-sequence lengths (3.7k rows: ~1m42/step qint8 vs 20.7-35s bf16; exact ratio to re-verify on an
-idle machine — interactive GPU load polluted the afternoon numbers) — the kernels target M=1
-LLM generation. Quantization
-here is a MEMORY/LOAD tool (peak 34 GB vs 63; prequantized files 3.3x smaller), not a speed tool.
-Recommended 96 GB config: prequantized qint8 text encoder (one forward, penalty irrelevant) +
-full-precision transformer.
+**Also measured** (clean idle benchmarks, 2026-08-05 evening, 3.7k-token steps): qint8
+transformer steps are ~1.34x bf16 (41.9s vs 31.2s avg) for a 45% peak-memory cut (34.4 vs
+63.2 GB). An earlier "5x slower" reading was interactive-GPU-contention pollution — always
+benchmark with NOTHING else running, including the assistant's own parallel work. Cold
+prequantized TE load: 30s (the 2.6s figure was file-cache-warm) vs 55.7s bf16.
+Recommended 96 GB config: prequantized qint8 text encoder always; transformer bf16 for speed
+or qint8 when memory headroom matters.
