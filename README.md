@@ -10,11 +10,12 @@ denoises a single packed sequence holding text, audio and video rows at once. 24
 
 ## Examples
 
-| 🦊 [Fox in snow](docs/examples/t2va/fox-snow-960x544.mp4) | 🥁 [Drum solo](docs/examples/t2va/drum-solo-768x768.mp4) |
+| 🦊✨ [Fox showcase — full specs](docs/examples/t2va/fox-showcase-768x768.mp4) | 🥁 [Drum solo](docs/examples/t2va/drum-solo-768x768.mp4) |
 |---|---|
-| ![fox](docs/examples/t2va/fox-frame.png) | ![drums](docs/examples/t2va/drums-frame.png) |
+| ![showcase](docs/examples/t2va/fox-showcase-frame.png) | ![drums](docs/examples/t2va/drums-frame.png) |
 
-Details and prompts in [docs/examples/t2va](docs/examples/t2va/README.md).
+More (including the first 960×544 fox) in [docs/examples/t2va](docs/examples/t2va/README.md).
+
 
 ## Status (August 2026)
 

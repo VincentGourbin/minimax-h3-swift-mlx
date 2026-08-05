@@ -15,6 +15,19 @@ no post-hoc audio.
   (H3 mixes at scene-faithful loudness: a quiet scene decodes quiet — see
   `docs/knowledge/playbooks/context-ir-prompting.md`)
 
+## 🦊✨ Fox showcase (full specs) — [fox-showcase-768x768.mp4](fox-showcase-768x768.mp4)
+
+![showcase frame](fox-showcase-frame.png)
+
+- **Prompt**: full Context-IR format with two shots — the fox trots, pauses at `[Shot 2] At
+  00:03.500` (ears pricking toward camera, visible breath), then resumes; `overall_soundscape:`
+  scores the footstep crunches stopping during the pause
+- 768×768 (trained short-edge regime), 124 frames (5.2 s), 50 sigma points, seed 42,
+  prequantized qint8 text encoder + bf16 transformer, `--normalize-audio`
+- ~4 h 20 denoising (~5.4 min/step at ~22k packed tokens) on M3 Max
+- The shot-2 direction lands: the pause, the ear turn and the interrupted footsteps are all in
+  the clip
+
 ## 🥁 Drum solo — [drum-solo-768x768.mp4](drum-solo-768x768.mp4)
 
 ![drums frame](drums-frame.png)
