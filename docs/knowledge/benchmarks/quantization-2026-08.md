@@ -64,6 +64,32 @@ shard-wise quantize-during-load to cap the transient without a prequantized file
 | Text encoder | 55.7 s (48 GB read) | 30 s cold / 2.6 s cache-warm (27.5 GB) |
 | Transformer | 1 m 15 (62 GB read) | 39.7 s (36 GB) |
 
+## Visual comparison (5.2 s, 124 frames, 20 sigma points, same seed)
+
+Seven full generations, identical in everything but the transformer's quantization —
+[mosaic video](../../examples/t2va/quant-mosaic-7modes.mp4) ·
+[contact sheet](../../examples/t2va/quant-contact-sheet.png).
+
+| Mode | Wall time | PSNR vs bf16 | Visual verdict |
+|---|---|---|---|
+| bf16 | 94 min | — | reference |
+| qint8 | 104 min¹ | 20.0 dB | same fox, same shot — identity preserved |
+| qint6 | 90 min | 19.5 dB | same fox, same shot |
+| int4 | 91 min | 14.5 dB | different sample (clean) |
+| nvfp4 | 97 min | 15.1 dB | different framing (clean) |
+| mxfp8 | 97 min | 15.4 dB | different sample, soundtrack drifted |
+| mxfp4 | 92 min | 14.9 dB | heavy divergence, softest detail of the set |
+
+¹ Daytime interactive machine use adds ±10 % noise to wall times; treat them as equal.
+
+**The headline lesson: quantization preserves sample QUALITY, not sample IDENTITY.** Tiny
+per-step weight perturbations compound chaotically over 19 steps: affine 8/6-bit stays on the
+bf16 trajectory (same fox, same composition); every ~5-fidelity mode (4-bit, mxfp) lands on a
+different — still clean — sample, including a different soundtrack (audio is denoised jointly;
+one divergent run even gained background music, unconstrained by this simple prompt). Exact
+cross-mode reproducibility does not exist in diffusion; per-forward parity is the real
+degradation metric, PSNR only measures trajectory divergence.
+
 ## Recommendation
 
 **Prequantized qint8 for both components** is the default: near-transparent fidelity, no speed
