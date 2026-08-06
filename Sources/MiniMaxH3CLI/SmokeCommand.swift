@@ -18,8 +18,11 @@ struct SmokeCommand: AsyncParsableCommand {
     @Option(name: .long, help: "Model directory (diffusers layout).")
     var modelsDir: String = defaultModelsDirectory()
 
-    @Option(name: .long, help: "Quantization probe: none | qint8 | qint6 | int4.")
+    @Option(name: .long, help: "Quantization probe: none | qint8 | qint6 | int4 | mxfp8 | mxfp4 | nvfp4.")
     var quant: String = "none"
+
+    @Flag(name: .long, help: "Load from the prequantized export instead of quantizing on the fly.")
+    var fromPrequantized = false
 
     func run() async throws {
         H3Debug.isEnabled = true
@@ -81,7 +84,7 @@ struct SmokeCommand: AsyncParsableCommand {
         let encoder = try H3WeightLoader.loadTextEncoder(
             modelDirectory: directory,
             quantization: H3Quantization(rawValue: quant) ?? .none,
-            skipPrequantizedPickup: true)
+            skipPrequantizedPickup: !fromPrequantized)
         print(String(format: "  loaded in %.1f s", Date().timeIntervalSince(start)))
         let ids = MLXArray([Int32](arrayLiteral: 3838, 374, 264, 1273)).expandedDimensions(axis: 0)
         let hidden = encoder(ids)

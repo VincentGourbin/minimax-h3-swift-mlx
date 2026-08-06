@@ -56,6 +56,8 @@ Affine beats microscaling on fidelity for this checkpoint; every mode still yiel
 (same-seed PSNR vs bf16 — qint8 33 dB, int4/mxfp8 ~20 dB — measures diffusion-trajectory
 divergence, not visual quality). **Recommended default: prequantized qint8 for both components**
 — near-transparent fidelity, bf16-or-better step speed, −45 % peak memory, ~2× faster loads.
+Full methodology and numbers: [docs/knowledge/benchmarks/quantization-2026-08.md](docs/knowledge/benchmarks/quantization-2026-08.md);
+the prequantized export/load round-trip is validated bit-exact for every mode family.
 
 **Not yet:**
 - fl2va (first/last keyframe): needs the Qwen3-VL vision tower + the causal video VAE encoder
