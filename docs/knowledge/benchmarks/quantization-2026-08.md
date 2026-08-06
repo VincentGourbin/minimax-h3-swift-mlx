@@ -35,6 +35,15 @@ device: Apple M3 Max, 96 GB unified memory
 
 Audio-branch fidelity follows the same ordering (qint8 0.62 … mxfp4 2.59, noise 0.62).
 
+## Memory caveat (important)
+
+The "Peak MLX" column samples memory at PHASE BOUNDARIES only (profiler limitation): it shows
+cruising peaks, not transients. **On-the-fly quantization still materializes the full 62 GB bf16
+transformer during its load phase** before shrinking — invisible to the sampling. Practical
+consequence: on 32-64 GB machines, on-the-fly transformer quantization does NOT fit; only the
+prequantized path (which never materializes bf16) honors the reduced budget. Future improvement:
+shard-wise quantize-during-load to cap the transient without a prequantized file.
+
 ## Findings
 
 1. **Quantized steps run at bf16 speed or slightly better** at this sequence length — the
