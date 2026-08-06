@@ -40,11 +40,22 @@ More (including the first 960×544 fox) in [docs/examples/t2va](docs/examples/t2
 **Quantization** (`--transformer-quant` / `--text-encoder-quant`, qint8/qint6/int4, MiniMax's
 official module exclusions; `export-quantized` writes reusable prequantized checkpoints that
 loaders pick up automatically):
-- Prequantized qint8 text encoder: cold load 55.7 → 30 s (2.6 s warm), file 52 → 27.5 GB,
-  −25 GB resident, output identical
-- qint8 transformer: steps ~1.34× bf16 (idle benchmarks) for a 45 % peak-memory cut
-  (63 → 34 GB) — bf16 for speed, qint8 for memory headroom; prequantized files load without
-  re-reading the bf16 checkpoint
+All MLX modes are wired (affine qint8/qint6/int4, microscaling mxfp8/mxfp4, nvfp4). Idle
+benchmarks, same seed, 3.7k-token steps — per-forward fidelity is max|Δ| of the DiT block-0
+velocity vs the reference (bf16 noise floor: 1.11 on a 260 scale):
+
+| Mode | Fidelity | Step | Transformer resident | Load |
+|---|---|---|---|---|
+| bf16 | 1.11 | 31.2 s | 61.7 GB | 1 m 15 |
+| **qint8** | **1.41** | **28.0 s** | **18.5 GB (+16 AdaLN scales)** | **39.7 s prequantized** |
+| mxfp8 | 5.16 | 24.5 s | ~33 GB peak | on-the-fly |
+| int4 | 5.32 | 23.6 s | ~19 GB peak | on-the-fly |
+| mxfp4 | 7.22 | — | — | — |
+
+Affine beats microscaling on fidelity for this checkpoint; every mode still yields clean samples
+(same-seed PSNR vs bf16 — qint8 33 dB, int4/mxfp8 ~20 dB — measures diffusion-trajectory
+divergence, not visual quality). **Recommended default: prequantized qint8 for both components**
+— near-transparent fidelity, bf16-or-better step speed, −45 % peak memory, ~2× faster loads.
 
 **Not yet:**
 - fl2va (first/last keyframe): needs the Qwen3-VL vision tower + the causal video VAE encoder

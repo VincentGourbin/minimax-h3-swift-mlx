@@ -15,33 +15,36 @@ public enum H3Quantization: String, CaseIterable, Sendable, Codable {
     case qint8
     case qint6
     case int4
+    case mxfp8
+    case mxfp4
+    case nvfp4
 
     /// (bits, groupSize, mode) for MLXNN's quantizer, nil = keep full precision.
+    /// Group sizes are format-dictated (MLX rejects others): affine 64, mxfp 32, nvfp4 16.
     public var descriptor: (bits: Int, groupSize: Int, mode: QuantizationMode)? {
         switch self {
         case .none: return nil
         case .qint8: return (8, 64, .affine)
         case .qint6: return (6, 64, .affine)
         case .int4: return (4, 64, .affine)
+        case .mxfp8: return (8, 32, .mxfp8)
+        case .mxfp4: return (4, 32, .mxfp4)
+        case .nvfp4: return (4, 16, .nvfp4)
         }
     }
 
     public var displayName: String {
-        switch self {
-        case .none: return "full precision (bf16/fp32 mixed)"
-        case .qint8: return "8-bit affine (group 64)"
-        case .qint6: return "6-bit affine (group 64)"
-        case .int4: return "4-bit affine (group 64)"
-        }
+        guard let descriptor else { return "full precision (bf16/fp32 mixed)" }
+        return "\(rawValue) (\(descriptor.bits)-bit, group \(descriptor.groupSize))"
     }
 
     /// Approximate resident size of the 33B transformer under this preset.
     public var estimatedTransformerGB: Double {
         switch self {
         case .none: return 61.7
-        case .qint8: return 18.5
+        case .qint8, .mxfp8: return 18.5
         case .qint6: return 14.5
-        case .int4: return 10.5
+        case .int4, .mxfp4, .nvfp4: return 10.5
         }
     }
 }

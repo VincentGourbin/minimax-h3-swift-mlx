@@ -184,11 +184,17 @@ final class H3FeedForward: Module {
     }
 }
 
-/// Compute dtype of a possibly-quantized Linear: a QuantizedLinear's `weight` is the packed
-/// uint32 tensor — casting activations to it corrupts them; its `scales` carry the real dtype.
+/// Compute dtype of a possibly-quantized Linear. A QuantizedLinear's `weight` is the packed
+/// uint32 tensor, and for the mxfp/nvfp modes its `scales` are uint8 exponents — neither is a
+/// valid activation dtype. Only trust a floating scales dtype; otherwise the packed stream runs
+/// at the checkpoint's bf16.
 @inline(__always)
 func computeDType(_ linear: Linear) -> DType {
-    (linear as? QuantizedLinear)?.scales.dtype ?? linear.weight.dtype
+    guard let quantized = linear as? QuantizedLinear else { return linear.weight.dtype }
+    switch quantized.scales.dtype {
+    case .float16, .bfloat16, .float32: return quantized.scales.dtype
+    default: return .bfloat16
+    }
 }
 
 // MARK: - Timestep embedding
