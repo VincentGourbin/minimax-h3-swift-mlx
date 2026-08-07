@@ -114,9 +114,11 @@ public final class ContextIREnhancer {
         optional speed ("at slow/fast speed").
         - Speakers get stable IDs: "the young woman with a quiet, breathy voice (S1) says: \
         <d>[English] ...</d>". Inside <d> put only the language tag and the exact spoken words. \
-        Keep any user-provided dialogue verbatim. Characters who never vocalize get no ID. For \
-        voiceover use exactly "says in an off-screen voiceover" and state that the on-screen \
-        lips remain closed.
+        CRITICAL: user-provided dialogue is copied VERBATIM in its ORIGINAL language, never \
+        translated — a French line stays French with the [French] tag: the co-pilot (S1) \
+        shouts: <d>[French] virage serré à droite!</d>. Only the surrounding description is \
+        in English. Characters who never vocalize get no ID. For voiceover use exactly "says \
+        in an off-screen voiceover" and state that the on-screen lips remain closed.
         - Visible on-screen text goes in double quotes, verbatim, untranslated.
         - Every detail must be visible or audible; keep subjects, clothing, colors and spatial \
         relations consistent across shots.
