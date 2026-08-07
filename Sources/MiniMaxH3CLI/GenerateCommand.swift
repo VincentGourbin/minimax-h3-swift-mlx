@@ -3,6 +3,7 @@
 
 import ArgumentParser
 import Foundation
+import H3PromptEnhancer
 import MiniMaxH3
 import MLX
 
@@ -57,6 +58,9 @@ struct GenerateCommand: AsyncParsableCommand {
     @Flag(name: .long, help: "Peak-normalize the audio track to -3 dBFS at mux time.")
     var normalizeAudio = false
 
+    @Flag(name: .long, help: "Rewrite the prompt into Context-IR format with local Gemma 4 first.")
+    var enhancePrompt = false
+
     @Flag(name: .long, help: "Verbose debug logging.")
     var debug = false
 
@@ -83,7 +87,21 @@ struct GenerateCommand: AsyncParsableCommand {
             }
         }
 
-        var request = H3GenerationRequest(prompt: prompt)
+        var finalPrompt = prompt
+        if enhancePrompt {
+            let duration = Double(try H3Geometry.alignNumFrames(frames)) / Double(H3Constants.fps)
+            print("Enhancing prompt (Gemma 4 E4B)…")
+            let enhancer = await ContextIREnhancer()
+            try await enhancer.load(progress: nil)
+            finalPrompt = try await enhancer.enhance(prompt, durationSeconds: duration)
+            await enhancer.unload()
+            print("— Context-IR prompt —\n\(finalPrompt)\n———")
+            let promptURL = URL(fileURLWithPath: output).deletingPathExtension()
+                .appendingPathExtension("prompt.txt")
+            try? finalPrompt.write(to: promptURL, atomically: true, encoding: .utf8)
+        }
+
+        var request = H3GenerationRequest(prompt: finalPrompt)
         request.height = height
         request.width = width
         request.numFrames = frames

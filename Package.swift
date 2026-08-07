@@ -19,6 +19,8 @@ let package = Package(
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.3"),
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.8.2"),
         .package(url: "https://github.com/VincentGourbin/swift-mlx-profiler", from: "1.4.0"),
+        // Local Context-IR prompt rewriting (--enhance-prompt).
+        .package(url: "https://github.com/VincentGourbin/gemma-4-swift-mlx", from: "1.0.0"),
     ],
     targets: [
         // MARK: - Libraries
@@ -34,11 +36,19 @@ let package = Package(
                 .product(name: "MLXProfiler", package: "swift-mlx-profiler"),
             ]
         ),
+        .target(
+            name: "H3PromptEnhancer",
+            dependencies: [
+                "MiniMaxH3",
+                .product(name: "Gemma4Swift", package: "gemma-4-swift-mlx"),
+            ]
+        ),
         // MARK: - CLI Tools
         .executableTarget(
             name: "MiniMaxH3CLI",
             dependencies: [
                 "MiniMaxH3",
+                "H3PromptEnhancer",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ]
         ),
