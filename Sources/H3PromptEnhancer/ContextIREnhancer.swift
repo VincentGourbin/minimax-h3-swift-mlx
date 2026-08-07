@@ -67,7 +67,7 @@ public final class ContextIREnhancer {
     }
 
     /// Remove Gemma channel markers (thinking blocks) and code fences from the raw completion.
-    static func stripDecorations(_ raw: String) -> String {
+    nonisolated static func stripDecorations(_ raw: String) -> String {
         var text = raw
         // Keep only the content after the last response-channel marker, if any are present.
         if let range = text.range(of: "<|channel|>response", options: .backwards) {
@@ -81,12 +81,15 @@ public final class ContextIREnhancer {
         }
         text = text.replacingOccurrences(of: "```text", with: "")
         text = text.replacingOccurrences(of: "```", with: "")
+        // Trailing turn-marker fragments occasionally leak through the token filter.
+        text = text.replacingOccurrences(
+            of: "<[|]?(turn|end_of_turn|eot)[|]?>", with: "", options: .regularExpression)
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     // MARK: - System prompt (condensed from MiniMax's official prompt-writing guide)
 
-    static let systemPrompt = """
+    nonisolated static let systemPrompt = """
         You are H3-Context-IR, the prompt-structuring stage of the MiniMax-H3 video+audio \
         generator. Rewrite the user's request into EXACTLY this format, in English, and output \
         NOTHING else — no commentary, no markdown fences, no reasoning:

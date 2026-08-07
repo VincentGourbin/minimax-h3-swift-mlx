@@ -31,10 +31,13 @@ More (including the first 960×544 fox) in [docs/examples/t2va](docs/examples/t2
   console report + Perfetto trace
 - Crash-safe generation: raw frames+audio saved as `.raw.safetensors` before muxing;
   `minimax-h3 mux` rebuilds an MP4 anytime (`--normalize-audio` for quiet scenes)
-- **Local Context-IR** (`minimax-h3 enhance`, `generate --enhance-prompt`): Gemma 4 E4B rewrites
-  free-form prompts into the structured format H3 was trained on (~5 s per rewrite, via
+- **Local Context-IR, multimodal** (`minimax-h3 enhance`, `generate --enhance-prompt`): Gemma 4
+  E4B rewrites free-form prompts into the structured format H3 was trained on (~5-20 s, via
   [gemma-4-swift-mlx](https://github.com/VincentGourbin/gemma-4-swift-mlx)) — the local
-  substitute for MiniMax's hosted H3-Context-IR stage
+  substitute for MiniMax's hosted H3-Context-IR stage. Reference media drive the official
+  cookbook formats: `--image` (I2VA), `--image + --last-image` (FL2VA), `--last-image` (L2VA),
+  `--audio` (soundscape/music mirrored, speech transcribed verbatim into `<d>`), `--video`
+  (shots/camera/pacing as structural inspiration)
 
 **Timings (M3 Max, bf16, full precision):**
 - ~23 s/step at 960×544×22 frames (~3.7k packed tokens); ~4.5 min/step at 960×544×124 frames
@@ -115,6 +118,9 @@ minimax-h3 generate "..." --text-encoder-quant qint8 -o out.mp4
 
 # Rewrite a free-form prompt into H3's Context-IR format (local Gemma 4), or do it inline
 minimax-h3 enhance "un renard trotte dans la neige" -f 124
+minimax-h3 enhance "il repart entre les sapins" --image frame.png          # I2VA, image-anchored
+minimax-h3 enhance "même ambiance sonore" --audio clip.wav                 # soundscape transfer
+minimax-h3 enhance "même scène au coucher du soleil" --video ref.mp4       # structural reference
 minimax-h3 generate "un renard trotte dans la neige" --enhance-prompt -o fox.mp4
 
 # Rebuild an MP4 from a saved raw result (written automatically before every mux)

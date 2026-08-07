@@ -21,6 +21,8 @@ let package = Package(
         .package(url: "https://github.com/VincentGourbin/swift-mlx-profiler", from: "1.4.0"),
         // Local Context-IR prompt rewriting (--enhance-prompt).
         .package(url: "https://github.com/VincentGourbin/gemma-4-swift-mlx", from: "1.0.0"),
+        // Needed directly for the multimodal analyzer (container-level generation path).
+        .package(url: "https://github.com/ml-explore/mlx-swift-lm", .upToNextMinor(from: "3.31.4")),
     ],
     targets: [
         // MARK: - Libraries
@@ -41,6 +43,9 @@ let package = Package(
             dependencies: [
                 "MiniMaxH3",
                 .product(name: "Gemma4Swift", package: "gemma-4-swift-mlx"),
+                .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXRandom", package: "mlx-swift"),
             ]
         ),
         // MARK: - CLI Tools
