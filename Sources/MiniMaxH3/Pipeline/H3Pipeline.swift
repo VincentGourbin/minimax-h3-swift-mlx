@@ -58,9 +58,11 @@ public final class H3Pipeline {
 
     // MARK: - Stage 1: text encoding
 
-    /// Encode the t2va presentation: the verbatim prompt, no chat template, no special tokens.
+    /// Encode the presentation: the verbatim prompt for t2va; per-keyframe `"<Picture i>: "`
+    /// labels + vision blocks first for fl2va (keyframes already prepared onto the canvas).
+    /// The vision tower (0.4B fp32) runs and is freed before the 52 GB text stack loads.
     func encodePrompt(
-        _ prompt: String, quantization: H3Quantization
+        _ prompt: String, keyframes: [H3KeyframeImage] = [], quantization: H3Quantization
     ) async throws -> (embeds: MLXArray, tags: [Int32]) {
         let profiler = H3Profiler.shared
         report("Loading tokenizer")
@@ -68,9 +70,38 @@ public final class H3Pipeline {
         let tokenizer = try await AutoTokenizer.from(
             modelFolder: modelDirectory.appendingPathComponent("tokenizer")
         )
-        let tokenIds = tokenizer.encode(text: prompt, addSpecialTokens: false)
         profiler.end("Tokenization")
-        guard !tokenIds.isEmpty else { throw H3Error.invalidInput("Empty prompt after tokenization.") }
+
+        var imageEmbeds: MLXArray?
+        var deepstack = [MLXArray]()
+        var imageGrids = [(h: Int, w: Int)]()
+        if !keyframes.isEmpty {
+            report("Encoding \(keyframes.count) keyframe(s) (vision tower)")
+            profiler.start("Vision Tower")
+            var tower: Qwen3VLVisionTower? = try H3WeightLoader.loadVisionTower(
+                modelDirectory: modelDirectory)
+            var embedsPerImage = [MLXArray]()
+            var deepstackPerImage = [[MLXArray]]()
+            for keyframe in keyframes {
+                let (patches, gridH, gridW) = keyframe.visionPatches()
+                let (embeds, taps) = tower!(patches, gridH: gridH, gridW: gridW)
+                embedsPerImage.append(embeds)
+                deepstackPerImage.append(taps)
+                imageGrids.append((gridH, gridW))
+            }
+            imageEmbeds = concatenated(embedsPerImage, axis: 0)
+            deepstack = (0..<deepstackPerImage[0].count).map { level in
+                concatenated(deepstackPerImage.map { $0[level] }, axis: 0)
+            }
+            eval([imageEmbeds!] + deepstack)
+            tower = nil
+            Memory.clearCache()
+            profiler.end("Vision Tower")
+        }
+
+        let presentation = try H3Presentation(
+            prompt: prompt, imageGrids: imageGrids, tokenizer: tokenizer)
+        let layout = try presentation.multimodalLayout()
 
         report("Loading text encoder (Qwen3-VL-32B, layers 0-49)")
         profiler.start("Load Text Encoder")
@@ -78,12 +109,17 @@ public final class H3Pipeline {
             modelDirectory: modelDirectory, quantization: quantization)
         profiler.end("Load Text Encoder")
 
-        report("Encoding prompt (\(tokenIds.count) tokens)")
+        report("Encoding prompt (\(presentation.tokenIds.count) tokens)")
         profiler.start("Text Encoding")
-        let embeds = encoder(MLXArray(tokenIds.map(Int32.init)).expandedDimensions(axis: 0))
+        let embeds = encoder(
+            MLXArray(presentation.tokenIds).expandedDimensions(axis: 0),
+            imageEmbeds: imageEmbeds,
+            deepstack: deepstack,
+            layout: layout
+        )
         eval(embeds)
         profiler.end("Text Encoding")
-        return (embeds, [Int32](repeating: H3Constants.textTag, count: tokenIds.count))
+        return (embeds, presentation.tokenTags)
     }
 
     // MARK: - Generation

@@ -30,3 +30,17 @@ okf_version: "0.1"
 - 2026-08-07/08: E2E --enhance-prompt VALIDÉ : une phrase française -> Gemma Context-IR (dialogue [French] verbatim) -> H3 768x768/124f/30σ qint8 partout -> copilote casquée en pleine annonce, mix naturellement fort (pic -2.0 dB sans normalisation). Publié en exemple (rally-copilot). Episode TCC Lexar résolu: tccutil reset SystemPolicyRemovableVolumes com.apple.Terminal + popup Autoriser.
 - 2026-08-08: fl2va Phase A LIVRÉE : encodeur Video VAE (conv3d natif NDHWC — ltx boucle en conv2d mais ignore les strides temporels dont H3 a besoin ; reflect manuel p=1 ; GroupNorm t-isolé fp32 ; pad asymétrique downsamplers ; encodeClip tuilé + couture latente). Parité moments 0.00016/10.3 du premier coup (dump 384x384 tuilé). Encodeur fp32 préservé (piège: la passe fp16 décodeur l'aurait écrasé). Sample seed-42: RNG torch irreproductible -> parité sur moments, bruit MLX-local assumé.
 - 2026-08-08: fl2va Phase B (1/2) : tour vision Qwen3-VL portée et EXACTE (patch_embed conv3d plein-patch = Linear 1536->1152, pos-embed bilinéaire 48x48 réordonné bloc-major, rotary 2 axes 18+18 fp32, 27 blocs pré-LN, mergers GELU exact vs MLP GELU tanh, deepstack 8/16/24). Parité fp32 : embeds 3.8e-4/17.9, deepstack 1e-5. Leçon : 27 couches en bf16 composent jusqu'à 5% d'erreur max -> tour en fp32 (0.4B, une passe par requête). Reste Phase B : mrope 3D interleaved texte, injection embeds+deepstack, présentation '<Picture i>', préprocessing image Swift.
+- 2026-08-08: fl2va Phase B (2/2) LIVRÉE — conditioner multimodal complet. (1) Préprocessing image
+  Swift: LANCZOS fidèle à PIL (point fixe 22 bits, 2 passes uint8, horizontale d'abord) -> canvas
+  stretch/cover-crop BIT-EXACTS vs prepare_keyframe_image; patchify block-major Qwen2-VL (layout
+  patch [c][t][ph][pw], 1536) parité 6e-8. smart_resize = no-op par construction (canvas x32 dans
+  les bornes). (2) Encodeur texte: mrope 3D interleaved (T possède 0,3,...,57+60..63, H 1,4,...,58,
+  W 2,5,...,59), positions par runs de mm_token_types (seuls les <|image_pad|> sont type image;
+  vision_start/end = texte; le bloc image fige t et avance le curseur de max(gh,gw)/2, PAS du nombre
+  de tokens), injection embeds aux pads, deepstack ajouté après couches 0/1/2. (3) Présentation
+  "<Picture i>: " + bloc vision (tag H3 VIDEO) + prompt verbatim, câblée dans encodePrompt (tour
+  vision fp32 chargée puis libérée avant le stack 52 Go). Parité: token ids/mm types/positions
+  mrope EXACTS, couche 0 mm en fp32 max 1.7e-5 relatif (les 0.58% initiaux = bruit bf16, sonde
+  castée fp32 pour isoler). Non-régression text-layer0: 0.23% inchangé. Sondes: parity
+  keyframe-preprocess + text-layer0-mm. Reste Phase C: encodage VAE des keyframes (seed 42, cast
+  fp16), lignes de condition packées, CLI --image/--last-image.
