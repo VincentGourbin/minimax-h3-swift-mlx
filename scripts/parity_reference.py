@@ -100,6 +100,51 @@ def dump_video_vae_encode(models_dir: pathlib.Path) -> None:
     print("video-vae-encode:", tuple(moments.shape), "->", tuple(rows.shape))
 
 
+def dump_vision_tower(models_dir: pathlib.Path) -> None:
+    """Vision tower alone on a processor-produced synthetic image: embeds + deepstack."""
+    import json
+
+    import numpy as np
+    from safetensors import safe_open
+
+    text_dir = models_dir / "text_encoder"
+    index = json.loads((text_dir / "model.safetensors.index.json").read_text())["weight_map"]
+    wanted = {k: s for k, s in index.items() if k.startswith("model.visual.")}
+    weights = {}
+    for shard in sorted(set(wanted.values())):
+        with safe_open(text_dir / shard, framework="pt") as handle:
+            for key in handle.keys():
+                if key in wanted:
+                    weights[key] = handle.get_tensor(key)
+
+    from transformers import AutoConfig, AutoProcessor
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionModel
+
+    config = AutoConfig.from_pretrained(models_dir, subfolder="text_encoder")
+    visual = Qwen3VLVisionModel(config.vision_config)  # ~0.4B params, plain CPU construct
+    visual.load_state_dict({k[len("model.visual."):]: v for k, v in weights.items()})
+    visual = visual.eval().to(torch.float32)
+
+    processor = AutoProcessor.from_pretrained(models_dir, subfolder="processor")
+    rng = np.random.default_rng(7)
+    image = rng.integers(0, 255, (224, 320, 3), dtype=np.uint8)
+    batch = processor.image_processor(images=[image], return_tensors="pt")
+    pixel_values, grid_thw = batch["pixel_values"].to(torch.float32), batch["image_grid_thw"]
+    with torch.no_grad():
+        out = visual(pixel_values, grid_thw)
+    save_file(
+        {
+            "pixel_values": pixel_values.contiguous(),
+            "grid_thw": grid_thw,
+            "embeds": out.pooler_output.float().contiguous(),
+            "deepstack_0": out.deepstack_features[0].float().contiguous(),
+            "deepstack_2": out.deepstack_features[2].float().contiguous(),
+        },
+        out_dir(models_dir) / "vision_tower.safetensors",
+    )
+    print("vision-tower:", tuple(grid_thw.tolist()[0]), tuple(out.pooler_output.shape))
+
+
 def dump_text_layer0(models_dir: pathlib.Path) -> None:
     """Embeddings + first decoder layer only — enough to catch RoPE/GQA/norm mistakes cheaply."""
     import json
@@ -244,7 +289,7 @@ def dump_dit_block0(models_dir: pathlib.Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("component", choices=["audio-vae", "video-vae", "video-vae-encode", "text-layer0", "dit-block0"])
+    parser.add_argument("component", choices=["audio-vae", "video-vae", "video-vae-encode", "vision-tower", "text-layer0", "dit-block0"])
     parser.add_argument("--models-dir", default=os.environ.get("H3_MODELS_DIR", "/tmp/MiniMax-H3"))
     args = parser.parse_args()
     models_dir = pathlib.Path(args.models_dir)
@@ -252,6 +297,7 @@ def main() -> None:
         "audio-vae": dump_audio_vae,
         "video-vae": dump_video_vae,
         "video-vae-encode": dump_video_vae_encode,
+        "vision-tower": dump_vision_tower,
         "text-layer0": dump_text_layer0,
         "dit-block0": dump_dit_block0,
     }[args.component](models_dir)

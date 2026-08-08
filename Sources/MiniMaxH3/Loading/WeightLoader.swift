@@ -179,3 +179,29 @@ public enum H3WeightLoader {
         return model
     }
 }
+
+
+extension H3WeightLoader {
+    /// Load the Qwen3-VL vision tower (fl2va keyframes) from `<modelDir>/text_encoder`.
+    /// The full-patch conv3d patch embedding is reshaped into its equivalent Linear.
+    public static func loadVisionTower(modelDirectory: URL) throws -> Qwen3VLVisionTower {
+        let directory = modelDirectory.appendingPathComponent("text_encoder")
+        let config = try Qwen3VLVisionConfig.load(from: directory.appendingPathComponent("config.json"))
+        let model = Qwen3VLVisionTower(config: config)
+
+        let prefix = "model.visual."
+        var weights = try loadShardedWeights(directory: directory) { key in
+            guard key.hasPrefix(prefix) else { return nil }
+            return String(key.dropFirst(prefix.count))
+                .replacingOccurrences(of: "patch_embed.proj.", with: "patch_embed.")
+        }
+        if let pe = weights["patch_embed.weight"] {
+            weights["patch_embed.weight"] = pe.reshaped(pe.dim(0), -1)
+        }
+        // fp32: the tower is tiny (~0.4B) and runs once per request; 27 pre-LN blocks compound
+        // bf16 rounding into multi-percent outliers on the merged embeds.
+        for (key, value) in weights { weights[key] = value.asType(.float32) }
+        try apply(weights: weights, to: model, component: "vision_tower")
+        return model
+    }
+}

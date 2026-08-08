@@ -55,6 +55,19 @@ struct ParityCommand: AsyncParsableCommand {
             let moments = try vae.encodeClip(reference["pixels"]!)
             try compare(ours: moments, reference: reference["moments"]!, name: "moments")
 
+        case "vision-tower":
+            let reference = try loadArrays(
+                url: parityDir.appendingPathComponent("vision_tower.safetensors"))
+            let tower = try H3WeightLoader.loadVisionTower(modelDirectory: directory)
+            let grid = reference["grid_thw"]!.asType(.int32)
+            let (embeds, deepstack) = tower(
+                reference["pixel_values"]!,
+                gridH: Int(grid[0, 1].item(Int32.self)),
+                gridW: Int(grid[0, 2].item(Int32.self)))
+            try compare(ours: embeds, reference: reference["embeds"]!, name: "image embeds")
+            try compare(ours: deepstack[0], reference: reference["deepstack_0"]!, name: "deepstack[0]")
+            try compare(ours: deepstack[2], reference: reference["deepstack_2"]!, name: "deepstack[2]")
+
         case "text-layer0":
             // Embeddings + decoder layer 0 alone: catches RoPE/GQA/norm mistakes cheaply, and
             // validates that text-only interleaved-mrope really collapses to standard RoPE.
