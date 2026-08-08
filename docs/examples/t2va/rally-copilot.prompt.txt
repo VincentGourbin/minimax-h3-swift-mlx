@@ -1,0 +1,5 @@
+integrated_multimodal_description: [Shot 1] Live-action, extreme close-up inside a race car cockpit. The young woman, the race co-pilot, is intensely focused, her mouth moving as she speaks over the roar of the engine. The camera shakes slightly, mimicking the vehicle's movement. The race co-pilot (S1) shouts:<d>[French] virage serré à droite, puis fond à gauche</d>.
+
+overall_soundscape: The loud, high-pitched whine of the engine dominates the soundscape, punctuated by the crunch of gravel under the tires and the sharp, urgent voice of the co-pilot.
+
+non_diegetic_music: A tense, driving electronic score builds beneath the diegetic sounds, featuring a pulsing synth bassline and rapid hi-hat patterns.
