@@ -13,7 +13,14 @@ import Tokenizers
 
 public struct H3GenerationRequest: Sendable {
     public var prompt: String
-    /// nil -> canvas resolved from `aspectWidth:aspectHeight` (default 16:9, short edge 768).
+    /// fl2va: keyframe the video starts from. Stretched onto the canvas, which by default
+    /// adopts this image's aspect ratio.
+    public var image: H3KeyframeImage?
+    /// fl2va: keyframe the video ends on. Alone it anchors "last" (and sets the canvas aspect);
+    /// combined with `image` it follows that canvas and is cover-cropped onto it.
+    public var lastImage: H3KeyframeImage?
+    /// nil -> canvas resolved from the first keyframe's aspect ratio, else from
+    /// `aspectWidth:aspectHeight` (default 16:9, short edge 768).
     public var height: Int?
     public var width: Int?
     public var aspectWidth: Double = 16
@@ -122,19 +129,84 @@ public final class H3Pipeline {
         return (embeds, presentation.tokenTags)
     }
 
+    // MARK: - Stage 1b: keyframe VAE encoding (fl2va)
+
+    /// Encode prepared keyframes into packed conditioning rows (before noise augmentation).
+    ///
+    /// Reference contract (`MiniMaxH3KeyframeVaeEncoderStep.encode_keyframes`): single frames go
+    /// through the spatial encoder alone; the posterior is *sampled* under a fresh seed-42
+    /// generator per keyframe (independent of the request seed; torch and MLX RNGs differ, so
+    /// the draw is MLX-local); the sampled latent is rounded through float16 BEFORE normalization
+    /// — ~11 bits of every conditioning latent, part of the released model's conditioning.
+    func encodeKeyframes(
+        _ keyframes: [H3KeyframeImage], patchSize: (t: Int, h: Int, w: Int)
+    ) throws -> MLXArray {
+        let profiler = H3Profiler.shared
+        report("Encoding \(keyframes.count) keyframe(s) (video VAE)")
+        profiler.start("Keyframe VAE Encode")
+        var vae: H3VideoVAE? = try H3WeightLoader.loadVideoVAE(
+            modelDirectory: modelDirectory, includeEncoder: true)
+        let latentsMean = MLXArray(vae!.config.latentsMean).reshaped(1, -1, 1, 1, 1)
+        let latentsStd = MLXArray(vae!.config.latentsStd).reshaped(1, -1, 1, 1, 1)
+        let pixelMean = MLXArray(H3Constants.pixelMean).reshaped(1, -1, 1, 1, 1)
+        let pixelStd = MLXArray(H3Constants.pixelStd).reshaped(1, -1, 1, 1, 1)
+
+        var rows = [MLXArray]()
+        for keyframe in keyframes {
+            var pixels = MLXArray(keyframe.pixels, [keyframe.height, keyframe.width, 3])
+                .asType(.float32)
+                .transposed(2, 0, 1)
+                .reshaped(1, 3, 1, keyframe.height, keyframe.width)
+            pixels = (pixels / 255.0 - pixelMean) / pixelStd
+            let moments = try vae!.encodeClip(pixels)  // (1, 2C, 1, hLat, wLat)
+            let channels = moments.dim(1) / 2
+            let mean = moments[0..., ..<channels]
+            let logvar = clip(moments[0..., channels...], min: -30.0, max: 20.0)
+            MLXRandom.seed(H3Constants.keyframeEncodeSeed)
+            let sampled = mean + exp(0.5 * logvar) * MLXRandom.normal(mean.shape, type: Float.self)
+            let latents = sampled.asType(.float16).asType(.float32)
+            rows.append(
+                H3Packing.patchifyVideoLatents((latents - latentsMean) / latentsStd, patchSize: patchSize))
+        }
+        let conditionRows = concatenated(rows, axis: 0)
+        eval(conditionRows)
+        vae = nil
+        Memory.clearCache()
+        profiler.end("Keyframe VAE Encode")
+        return conditionRows
+    }
+
     // MARK: - Generation
 
     public func generate(_ request: H3GenerationRequest) async throws -> H3GenerationResult {
-        // 1. Geometry.
+        // 1. Geometry. The first keyframe (if any) is the geometry anchor: it sets the canvas
+        // aspect and is stretched onto it; a second keyframe follows and is cover-cropped.
+        var keyframes = [H3KeyframeImage]()
+        var keyframeAnchors = [String]()
+        if let image = request.image {
+            keyframes.append(image)
+            keyframeAnchors.append("first")
+        }
+        if let lastImage = request.lastImage {
+            keyframes.append(lastImage)
+            keyframeAnchors.append("last")
+        }
+
         let (height, width): (Int, Int)
         if let h = request.height, let w = request.width {
             guard h % 32 == 0, w % 32 == 0 else {
                 throw H3Error.invalidInput("height/width must be multiples of 32, got \(h)x\(w).")
             }
             (height, width) = (h, w)
+        } else if let anchor = keyframes.first {
+            (height, width) = try H3Geometry.resolveCanvasSize(
+                aspectWidth: Double(anchor.width), aspectHeight: Double(anchor.height))
         } else {
             (height, width) = try H3Geometry.resolveCanvasSize(
                 aspectWidth: request.aspectWidth, aspectHeight: request.aspectHeight)
+        }
+        keyframes = keyframes.enumerated().map { index, keyframe in
+            keyframe.prepared(canvasWidth: width, canvasHeight: height, stretch: index == 0)
         }
         let numFrames = try H3Geometry.alignNumFrames(request.numFrames)
         let duration = Double(numFrames) / Double(H3Constants.fps)
@@ -153,10 +225,15 @@ public final class H3Pipeline {
             "canvas \(width)x\(height), \(numFrames) frames -> latents \(latentFrames)x\(latentHeight)x\(latentWidth), "
                 + "\(audioLatents) audio latents/channel")
 
-        // 2. Text conditioning, then free the encoder before anything big loads.
+        // 2. Text conditioning (vision tower first for fl2va), then free the encoder before
+        // anything big loads.
         let (promptEmbeds, textTags) = try await encodePrompt(
-            request.prompt, quantization: request.textEncoderQuantization)
+            request.prompt, keyframes: keyframes, quantization: request.textEncoderQuantization)
         Memory.clearCache()
+
+        // 2b. Keyframe conditioning rows (before noise augmentation).
+        var conditionRows = keyframes.isEmpty
+            ? nil : try encodeKeyframes(keyframes, patchSize: patch)
 
         // 3. Packed layout and schedules.
         let layout = try H3Packing.buildPackedSequence(
@@ -165,9 +242,11 @@ public final class H3Pipeline {
             latentHeight: latentHeight,
             latentWidth: latentWidth,
             numAudioLatents: audioLatents,
-            patchSize: patch
+            patchSize: patch,
+            keyframeAnchors: keyframeAnchors
         )
-        H3Debug.log("packed sequence: \(layout.sequenceLength) rows")
+        H3Debug.log("packed sequence: \(layout.sequenceLength) rows "
+            + "(\(layout.numConditionVideoRows) condition)")
 
         let videoScheduler = H3Scheduler(shift: request.flowShift)
         let audioScheduler = H3Scheduler(shift: request.audioFlowShift)
@@ -175,9 +254,23 @@ public final class H3Pipeline {
         try audioScheduler.setTimesteps(numInferenceSteps: request.numInferenceSteps)
         let stepCount = min(videoScheduler.timesteps.count, audioScheduler.timesteps.count)
 
-        // 4. Initial noise: video latent tensor first, then audio rows (draw order is part of the
-        // request's reproducibility contract; torch and MLX RNGs differ, so seeds are MLX-local).
+        // 4. Noise, off the request seed. Draw order is part of the reproducibility contract
+        // (torch and MLX RNGs differ, so seeds are MLX-local): condition noise per keyframe
+        // FIRST, then the video latent tensor, then the audio rows. Condition rows are mixed to
+        // the constant conditioning level (`scale_noise`: t·x0 + (1−t)·noise at t = 0.999) once,
+        // and never touched again — they anchor the whole denoising loop.
         MLXRandom.seed(request.seed)
+        if let rows = conditionRows {
+            var noiseRows = [MLXArray]()
+            for _ in keyframeAnchors {
+                let noise = MLXRandom.normal([1, 24, 1, latentHeight, latentWidth], type: Float.self)
+                noiseRows.append(H3Packing.patchifyVideoLatents(noise, patchSize: patch))
+            }
+            let noise = concatenated(noiseRows, axis: 0)
+            let aug = H3Constants.keyframeNoiseAug
+            conditionRows = aug * rows + (1 - aug) * noise
+            eval(conditionRows!)
+        }
         let videoNoise = MLXRandom.normal([1, 24, latentFrames, latentHeight, latentWidth], type: Float.self)
         var videoRows = H3Packing.patchifyVideoLatents(videoNoise, patchSize: patch)
         var audioRows = MLXRandom.normal([audioLatents * H3Constants.audioChannels, 32], type: Float.self)
@@ -205,16 +298,21 @@ public final class H3Pipeline {
                 conditionVideoTimestep: max(videoT, H3Constants.keyframeNoiseAug),
                 conditionAudioTimestep: 1.0
             )
+            let packedVideoRows = conditionRows.map { concatenated([$0, videoRows], axis: 0) }
+                ?? videoRows
             let (videoVelocity, audioVelocity) = transformer!(
-                videoRows: videoRows,
+                videoRows: packedVideoRows,
                 audioRows: audioRows,
                 textEmbeds: promptEmbeds,
                 timesteps: timesteps,
                 timestepIndices: timestepIndices,
                 layout: layout
             )
+            // Only the generated rows step; the conditioning rows are never updated.
+            let generatedVelocity = conditionRows == nil
+                ? videoVelocity : videoVelocity[layout.numConditionVideoRows...]
             videoRows = try videoScheduler.step(
-                modelOutput: videoVelocity, timestep: videoT, sample: videoRows)
+                modelOutput: generatedVelocity, timestep: videoT, sample: videoRows)
             audioRows = try audioScheduler.step(
                 modelOutput: audioVelocity, timestep: audioT, sample: audioRows)
             eval(videoRows, audioRows)

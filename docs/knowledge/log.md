@@ -44,3 +44,12 @@ okf_version: "0.1"
   castée fp32 pour isoler). Non-régression text-layer0: 0.23% inchangé. Sondes: parity
   keyframe-preprocess + text-layer0-mm. Reste Phase C: encodage VAE des keyframes (seed 42, cast
   fp16), lignes de condition packées, CLI --image/--last-image.
+- 2026-08-08 (soir): fl2va Phase C LIVRÉE — i2va/fl2va FONCTIONNE E2E. Encodage keyframe conforme au
+  contrat release: posterior seed 42 FRAIS par image (générateur indépendant du seed requête),
+  arrondi fp16 AVANT normalisation, noise-aug 0.999*x0+0.001*bruit avec bruit de condition tiré
+  avant les bruits vidéo/audio (ordre des tirages = contrat de reproductibilité). Canvas ancré sur
+  l'aspect du 1er keyframe (stretch; le 2e cover-crop). Transformer/packing supportaient déjà les
+  condition rows (concat devant les lignes vidéo, scheduler.step sur les seules lignes générées,
+  t épinglé max(σ,0.999)). CLI: generate --image/--last-image. Smoke 512x288/22f/8σ qint8 en 139 s:
+  frame 0 = keyframe (fox), frame 21 = renard avancé, arrière-plan cohérent. Reste optionnel:
+  parité E2E hidden_states[50] lourde (~50 Go CPU torch, overnight) et un run qualité 768p.
