@@ -10,11 +10,18 @@ import MLX
 struct GenerateCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "generate",
-        abstract: "Generate a video with synchronized stereo audio from a text prompt (t2va)."
+        abstract: "Generate a video with synchronized stereo audio from a text prompt (t2va), "
+            + "optionally anchored on keyframe images (fl2va)."
     )
 
     @Argument(help: "The text prompt.")
     var prompt: String
+
+    @Option(name: .long, help: "fl2va: keyframe image the video starts from (sets the canvas aspect).")
+    var image: String?
+
+    @Option(name: .long, help: "fl2va: keyframe image the video ends on (alone, generates up to it).")
+    var lastImage: String?
 
     @Option(name: .shortAndLong, help: "Output MP4 path.")
     var output: String = "output.mp4"
@@ -102,6 +109,12 @@ struct GenerateCommand: AsyncParsableCommand {
         }
 
         var request = H3GenerationRequest(prompt: finalPrompt)
+        if let image {
+            request.image = try H3KeyframeImage.load(from: URL(fileURLWithPath: image))
+        }
+        if let lastImage {
+            request.lastImage = try H3KeyframeImage.load(from: URL(fileURLWithPath: lastImage))
+        }
         request.height = height
         request.width = width
         request.numFrames = frames
