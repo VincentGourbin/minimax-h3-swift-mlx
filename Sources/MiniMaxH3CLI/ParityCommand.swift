@@ -9,6 +9,8 @@ import ArgumentParser
 import Foundation
 import MiniMaxH3
 import MLX
+import MLXNN
+import Tokenizers
 
 struct ParityCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
@@ -68,6 +70,77 @@ struct ParityCommand: AsyncParsableCommand {
             try compare(ours: deepstack[0], reference: reference["deepstack_0"]!, name: "deepstack[0]")
             try compare(ours: deepstack[2], reference: reference["deepstack_2"]!, name: "deepstack[2]")
 
+        case "keyframe-preprocess":
+            // Canvas preparation must be BIT-EXACT vs PIL (LANCZOS fixed point), and the
+            // patchify exactly reproduces the Qwen2-VL fast processor's block-major layout.
+            let reference = try loadArrays(
+                url: parityDir.appendingPathComponent("keyframe_preprocess.safetensors"))
+            let original = keyframeImage(from: reference["original"]!)
+            let stretched = original.prepared(canvasWidth: 448, canvasHeight: 256, stretch: true)
+            let covered = original.prepared(canvasWidth: 448, canvasHeight: 256, stretch: false)
+            try compare(
+                ours: MLXArray(stretched.pixels, [256, 448, 3]).asType(.float32),
+                reference: reference["canvas_stretch"]!.asType(.float32),
+                name: "canvas stretch (uint8)")
+            try compare(
+                ours: MLXArray(covered.pixels, [256, 448, 3]).asType(.float32),
+                reference: reference["canvas_cover"]!.asType(.float32),
+                name: "canvas cover (uint8)")
+            let (patches, gridH, gridW) = stretched.visionPatches()
+            let grid = reference["grid_thw"]!.asType(.int32)
+            guard gridH == Int(grid[0, 1].item(Int32.self)),
+                  gridW == Int(grid[0, 2].item(Int32.self))
+            else {
+                throw H3Error.generationFailed("grid \(gridH)x\(gridW) vs reference \(grid)")
+            }
+            try compare(ours: patches, reference: reference["pixel_values"]!, name: "pixel_values")
+
+        case "text-layer0-mm":
+            // The fl2va conditioner path through real layer 0: presentation token ids, mrope 3D
+            // positions, vision-embed injection, deepstack tap 0.
+            let reference = try loadArrays(
+                url: parityDir.appendingPathComponent("text_layer0_mm.safetensors"))
+            let image = keyframeImage(from: reference["image"]!)
+            let (patches, gridH, gridW) = image.visionPatches()
+            try compare(ours: patches, reference: reference["pixel_values"]!, name: "pixel_values")
+
+            let tokenizer = try await AutoTokenizer.from(
+                modelFolder: directory.appendingPathComponent("tokenizer"))
+            let presentation = try H3Presentation(
+                prompt: "a quiet forest at dawn",
+                imageGrids: [(gridH, gridW)],
+                tokenizer: tokenizer)
+            try compare(
+                ours: MLXArray(presentation.tokenIds).asType(.float32),
+                reference: reference["token_ids"]![0].asType(.float32),
+                name: "presentation token ids")
+            try compare(
+                ours: MLXArray(presentation.mmTokenTypes).asType(.float32),
+                reference: reference["mm_token_types"]![0].asType(.float32),
+                name: "mm token types")
+            let layout = try presentation.multimodalLayout()!
+            try compare(
+                ours: layout.positions.asType(.float32),
+                reference: reference["position_ids"]!.asType(.float32),
+                name: "mrope positions")
+
+            let tower = try H3WeightLoader.loadVisionTower(modelDirectory: directory)
+            let (imageEmbeds, deepstack) = tower(patches, gridH: gridH, gridW: gridW)
+            let encoder = try H3WeightLoader.loadTextEncoder(modelDirectory: directory, numLayers: 1)
+            // The reference dump runs fp32; cast the single layer to fp32 too so the check
+            // isolates implementation errors from bf16 rounding (production stays bf16).
+            let fp32 = Dictionary(
+                uniqueKeysWithValues: encoder.parameters().flattened().map {
+                    ($0.0, $0.1.asType(.float32))
+                })
+            encoder.update(parameters: ModuleParameters.unflattened(fp32))
+            let hidden = encoder(
+                MLXArray(presentation.tokenIds).expandedDimensions(axis: 0),
+                imageEmbeds: imageEmbeds,
+                deepstack: deepstack,
+                layout: layout)
+            try compare(ours: hidden, reference: reference["layer0_out"]!, name: "layer0 hidden (mm)")
+
         case "text-layer0":
             // Embeddings + decoder layer 0 alone: catches RoPE/GQA/norm mistakes cheaply, and
             // validates that text-only interleaved-mrope really collapses to standard RoPE.
@@ -110,6 +183,13 @@ struct ParityCommand: AsyncParsableCommand {
         default:
             throw ValidationError("Unknown component '\(component)'.")
         }
+    }
+
+    /// (H, W, 3) uint8 reference tensor -> bitmap.
+    private func keyframeImage(from array: MLXArray) -> H3KeyframeImage {
+        H3KeyframeImage(
+            width: array.dim(1), height: array.dim(0),
+            pixels: array.asType(.uint8).asArray(UInt8.self))
     }
 
     private func compare(ours: MLXArray, reference: MLXArray, name: String) throws {
