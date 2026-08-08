@@ -48,6 +48,13 @@ struct ParityCommand: AsyncParsableCommand {
             let ours = vae.decode(reference["latents"]!)
             try compare(ours: ours, reference: reference["video"]!, name: "video")
 
+        case "video-vae-encode":
+            let reference = try loadArrays(
+                url: parityDir.appendingPathComponent("video_vae_encode.safetensors"))
+            let vae = try H3WeightLoader.loadVideoVAE(modelDirectory: directory, includeEncoder: true)
+            let moments = try vae.encodeClip(reference["pixels"]!)
+            try compare(ours: moments, reference: reference["moments"]!, name: "moments")
+
         case "text-layer0":
             // Embeddings + decoder layer 0 alone: catches RoPE/GQA/norm mistakes cheaply, and
             // validates that text-only interleaved-mrope really collapses to standard RoPE.

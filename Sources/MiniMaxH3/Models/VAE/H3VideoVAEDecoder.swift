@@ -17,6 +17,10 @@ import MLXNN
 public struct H3VideoVAEConfig: Codable, Sendable {
     public var latentChannels = 24
     public var outChannels = 3
+    public var blockOutChannels = [128, 256, 256, 512, 512, 1024]
+    public var layersPerBlock = 2
+    public var normNumGroups = 32
+    public var normEps: Float = 1e-6
     public var spatialDownsampleFactors = [2, 2, 2, 2, 1, 1]
     public var temporalDownsampleFactors = [1, 2, 2, 1, 1, 1]
     public var decoderNumLayers = 36
@@ -35,6 +39,10 @@ public struct H3VideoVAEConfig: Codable, Sendable {
     enum CodingKeys: String, CodingKey {
         case latentChannels = "latent_channels"
         case outChannels = "out_channels"
+        case blockOutChannels = "block_out_channels"
+        case layersPerBlock = "layers_per_block"
+        case normNumGroups = "norm_num_groups"
+        case normEps = "norm_eps"
         case spatialDownsampleFactors = "spatial_downsample_factors"
         case temporalDownsampleFactors = "temporal_downsample_factors"
         case decoderNumLayers = "decoder_num_layers"
@@ -284,8 +292,10 @@ public final class H3VideoVAE: Module {
 
     @ModuleInfo(key: "post_quant_conv") var postQuantConv: Linear  // 1x1x1 conv3d == channel linear
     @ModuleInfo(key: "decoder") var decoder: H3VideoViTDecoder
+    @ModuleInfo(key: "quant_conv") var quantConv: Linear?
+    @ModuleInfo(key: "encoder") var encoder: H3VideoEncoder3d?
 
-    public init(config: H3VideoVAEConfig) {
+    public init(config: H3VideoVAEConfig, includeEncoder: Bool = false) {
         self.config = config
         let ratio = config.temporalCompressionRatio
         framePrePadding = (ratio - config.clipLength % ratio) % ratio
@@ -295,6 +305,70 @@ public final class H3VideoVAE: Module {
 
         _postQuantConv.wrappedValue = Linear(config.latentChannels, config.latentChannels, bias: true)
         _decoder.wrappedValue = H3VideoViTDecoder(config: config)
+        _quantConv.wrappedValue = includeEncoder
+            ? Linear(2 * config.latentChannels, 2 * config.latentChannels, bias: true) : nil
+        _encoder.wrappedValue = includeEncoder ? H3VideoEncoder3d(config: config) : nil
+    }
+
+    // MARK: - Encode (keyframes)
+
+    /// Encode one temporal clip (a single keyframe for fl2va), spatially tiled like the
+    /// reference. pixels: (1, 3, T, H, W) torch layout, ImageNet-normalized, float32.
+    /// Returns moments (1, 2*latentChannels, T', hLat, wLat).
+    public func encodeClip(_ pixels: MLXArray) throws -> MLXArray {
+        guard let encoder, let quantConv else {
+            throw H3Error.invalidConfiguration("VAE was loaded without its encoder")
+        }
+        let ndhwc = pixels.asType(.float32).transposed(0, 2, 3, 4, 1)
+
+        func encodeTile(_ tile: MLXArray) -> MLXArray {
+            // encoder output NDHWC -> quant_conv (1x1x1 == channel linear) -> NCDHW
+            let moments = quantConv(encoder(tile))
+            return moments.transposed(0, 4, 1, 2, 3)
+        }
+
+        if !useTiling {
+            return encodeTile(ndhwc)
+        }
+        let height = ndhwc.dim(2)
+        let width = ndhwc.dim(3)
+        let (yStarts, yLengths, yOverlaps) = splitTiles(
+            length: height, tileSize: tileSampleMinSize, minOverlap: tileSampleMinOverlap)
+        let (xStarts, xLengths, xOverlaps) = splitTiles(
+            length: width, tileSize: tileSampleMinSize, minOverlap: tileSampleMinOverlap)
+
+        var rows = [[MLXArray]]()
+        for (yPos, yLen) in zip(yStarts, yLengths) {
+            var row = [MLXArray]()
+            for (xPos, xLen) in zip(xStarts, xLengths) {
+                let tile = ndhwc[
+                    0..., 0...,
+                    yPos..<min(height, yPos + yLen),
+                    xPos..<min(width, xPos + xLen), 0...]
+                let encoded = encodeTile(tile)
+                eval(encoded)
+                row.append(encoded)
+            }
+            rows.append(row)
+        }
+
+        let ratio = config.spatialCompressionRatio
+        let latentYOverlaps = yOverlaps.map { $0 / ratio }
+        let latentXOverlaps = xOverlaps.map { $0 / ratio }
+        var resultRows = [MLXArray]()
+        for i in rows.indices {
+            var resultRow = [MLXArray]()
+            for j in rows[i].indices {
+                var tile = rows[i][j]
+                if i > 0 { tile = Self.blend(rows[i - 1][j], tile, extent: latentYOverlaps[i - 1], axis: -2) }
+                if j > 0 { tile = Self.blend(rows[i][j - 1], tile, extent: latentXOverlaps[j - 1], axis: -1) }
+                if i < rows.count - 1 { tile = tile[.ellipsis, ..<(tile.dim(-2) - latentYOverlaps[i]), 0...] }
+                if j < rows[i].count - 1 { tile = tile[.ellipsis, ..<(tile.dim(-1) - latentXOverlaps[j])] }
+                resultRow.append(tile)
+            }
+            resultRows.append(concatenated(resultRow, axis: -1))
+        }
+        return concatenated(resultRows, axis: -2)
     }
 
     /// Linear cross-fade of `b` over `a`'s trailing `extent` positions along `axis`.

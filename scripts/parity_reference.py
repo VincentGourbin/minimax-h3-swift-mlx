@@ -62,6 +62,44 @@ def dump_video_vae(models_dir: pathlib.Path) -> None:
     print("video-vae:", tuple(video.shape))
 
 
+def dump_video_vae_encode(models_dir: pathlib.Path) -> None:
+    """Keyframe encode path: _encode_clip (spatial encoder, tiled) + the full conditioning
+    recipe (posterior sampled at seed 42, fp16 rounding, normalization, patchify)."""
+    import sys as _sys
+
+    from diffusers import AutoencoderKLMiniMaxH3
+    from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
+
+    vae = AutoencoderKLMiniMaxH3.from_pretrained(models_dir, subfolder="vae")
+    vae.eval()
+    torch.manual_seed(1234)
+    # Synthetic keyframe in ImageNet-normalized space, 384x384 so the 256px tiling kicks in.
+    pixels = torch.randn(1, 3, 1, 384, 384, dtype=torch.float32) * 0.5
+    with torch.no_grad():
+        moments = vae._encode_clip(pixels)
+
+    posterior = DiagonalGaussianDistribution(moments)
+    latents = posterior.sample(generator=torch.Generator().manual_seed(42))
+    latents = latents.to(torch.float16).float()
+    latents_mean = torch.tensor(vae.config.latents_mean).view(1, -1, 1, 1, 1)
+    latents_std = torch.tensor(vae.config.latents_std).view(1, -1, 1, 1, 1)
+    normalized = (latents - latents_mean) / latents_std
+
+    _sys.path.insert(0, "src")
+    from diffusers.modular_pipelines.minimax_h3.packing import patchify_video_latents
+
+    rows = patchify_video_latents(normalized, (1, 2, 2))
+    save_file(
+        {
+            "pixels": pixels,
+            "moments": moments.contiguous(),
+            "condition_rows": rows.contiguous(),
+        },
+        out_dir(models_dir) / "video_vae_encode.safetensors",
+    )
+    print("video-vae-encode:", tuple(moments.shape), "->", tuple(rows.shape))
+
+
 def dump_text_layer0(models_dir: pathlib.Path) -> None:
     """Embeddings + first decoder layer only — enough to catch RoPE/GQA/norm mistakes cheaply."""
     import json
@@ -206,13 +244,14 @@ def dump_dit_block0(models_dir: pathlib.Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("component", choices=["audio-vae", "video-vae", "text-layer0", "dit-block0"])
+    parser.add_argument("component", choices=["audio-vae", "video-vae", "video-vae-encode", "text-layer0", "dit-block0"])
     parser.add_argument("--models-dir", default=os.environ.get("H3_MODELS_DIR", "/tmp/MiniMax-H3"))
     args = parser.parse_args()
     models_dir = pathlib.Path(args.models_dir)
     {
         "audio-vae": dump_audio_vae,
         "video-vae": dump_video_vae,
+        "video-vae-encode": dump_video_vae_encode,
         "text-layer0": dump_text_layer0,
         "dit-block0": dump_dit_block0,
     }[args.component](models_dir)

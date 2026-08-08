@@ -15,22 +15,37 @@ import MLXNN
 extension H3WeightLoader {
     // MARK: - Video VAE (decode path)
 
-    public static func loadVideoVAE(modelDirectory: URL) throws -> H3VideoVAE {
+    public static func loadVideoVAE(modelDirectory: URL, includeEncoder: Bool = false) throws -> H3VideoVAE {
         let directory = modelDirectory.appendingPathComponent("vae")
         let config = try H3VideoVAEConfig.load(from: directory.appendingPathComponent("config.json"))
-        let model = H3VideoVAE(config: config)
+        let model = H3VideoVAE(config: config, includeEncoder: includeEncoder)
 
         var weights = try loadShardedWeights(directory: directory) { key in
-            guard key.hasPrefix("decoder.") || key.hasPrefix("post_quant_conv.") else { return nil }
+            let isEncoderKey = key.hasPrefix("encoder.") || key.hasPrefix("quant_conv.")
+            guard key.hasPrefix("decoder.") || key.hasPrefix("post_quant_conv.")
+                || (includeEncoder && isEncoderKey) else { return nil }
             return key
                 .replacingOccurrences(of: ".to_out.0.", with: ".to_out.")
                 .replacingOccurrences(of: ".ff.net.0.proj.", with: ".ff.proj.")
                 .replacingOccurrences(of: ".ff.net.2.", with: ".ff.out.")
         }
+        if includeEncoder {
+            // Encoder conv3d weights: torch (O, I, D, H, W) -> MLX NDHWC layout (O, D, H, W, I);
+            // quant_conv 1x1x1 -> Linear. Encoder stays float32 (reference encodes keyframes fp32).
+            for (key, value) in weights where key.hasPrefix("encoder.") && value.ndim == 5 {
+                weights[key] = value.asType(.float32).transposed(0, 2, 3, 4, 1)
+            }
+            if let qcw = weights["quant_conv.weight"] {
+                weights["quant_conv.weight"] = qcw.asType(.float32).reshaped(qcw.dim(0), qcw.dim(1))
+            }
+            if let qcb = weights["quant_conv.bias"] { weights["quant_conv.bias"] = qcb.asType(.float32) }
+        }
         // The released decode recipe is float16 autocast over the float32 checkpoint (the
         // published frames are the fp16 ones). fp32 decode measured 6x slower with the GPU at
         // 17%. Norm math stays fp32 — the decoder blocks upcast explicitly before every norm.
-        for (key, value) in weights where value.dtype == .float32 {
+        // The ENCODER stays float32 (the reference encodes keyframes without autocast).
+        for (key, value) in weights
+        where value.dtype == .float32 && !key.hasPrefix("encoder.") && !key.hasPrefix("quant_conv.") {
             weights[key] = value.asType(.float16)
         }
         if let pqw = weights["post_quant_conv.weight"] {
