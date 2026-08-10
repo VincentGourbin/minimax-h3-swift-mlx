@@ -141,6 +141,54 @@ struct ParityCommand: AsyncParsableCommand {
                 layout: layout)
             try compare(ours: hidden, reference: reference["layer0_out"]!, name: "layer0 hidden (mm)")
 
+        case "conditioner-fl2va":
+            // Full-depth E2E: real keyframe + prompt -> hidden_states[50] with the production
+            // paths (bf16 text stack, fp32 vision tower) against the all-bf16 reference dump.
+            // Judged on relative RMS: per-component parity is exact (see the other probes), so
+            // what remains here is compounded bf16 rounding, not implementation error.
+            let reference = try loadArrays(
+                url: parityDir.appendingPathComponent("conditioner_fl2va.safetensors"))
+            let canvas = keyframeImage(from: reference["canvas"]!)
+            let (patches, gridH, gridW) = canvas.visionPatches()
+            let tokenizer = try await AutoTokenizer.from(
+                modelFolder: directory.appendingPathComponent("tokenizer"))
+            let presentation = try H3Presentation(
+                prompt: "A red fox walking through a snowy forest at dusk, soft wind, distant birdsong.",
+                imageGrids: [(gridH, gridW)],
+                tokenizer: tokenizer)
+            try compare(
+                ours: MLXArray(presentation.tokenIds).asType(.float32),
+                reference: reference["token_ids"]![0].asType(.float32),
+                name: "presentation token ids")
+            let layout = try presentation.multimodalLayout()!
+
+            let tower = try H3WeightLoader.loadVisionTower(modelDirectory: directory)
+            let (imageEmbeds, deepstack) = tower(patches, gridH: gridH, gridW: gridW)
+            let encoder = try H3WeightLoader.loadTextEncoder(modelDirectory: directory)
+            let hidden = encoder(
+                MLXArray(presentation.tokenIds).expandedDimensions(axis: 0),
+                imageEmbeds: imageEmbeds,
+                deepstack: deepstack,
+                layout: layout)
+
+            let ours = hidden.asType(.float32)
+            let ref = reference["hidden_50"]!.asType(.float32)
+            guard ours.shape == ref.shape else {
+                throw H3Error.generationFailed("hidden: shape \(ours.shape) vs \(ref.shape)")
+            }
+            let difference = ours - ref
+            let relRMS = (sqrt(mean(difference * difference))
+                / sqrt(mean(ref * ref))).item(Float.self)
+            let cosine = (sum(ours * ref)
+                / (sqrt(sum(ours * ours)) * sqrt(sum(ref * ref)))).item(Float.self)
+            let maxAbs = abs(difference).max().item(Float.self)
+            print("hidden_states[50]: rel RMS \(relRMS)  cosine \(cosine)  max|Δ| \(maxAbs)")
+            guard relRMS <= tolerance else {
+                throw H3Error.generationFailed(
+                    "hidden_states[50]: rel RMS \(relRMS) exceeds tolerance \(tolerance)")
+            }
+            print("PARITY OK")
+
         case "text-layer0":
             // Embeddings + decoder layer 0 alone: catches RoPE/GQA/norm mistakes cheaply, and
             // validates that text-only interleaved-mrope really collapses to standard RoPE.
