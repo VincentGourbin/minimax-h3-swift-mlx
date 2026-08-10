@@ -1,12 +1,14 @@
 # minimax-h3-swift-mlx
 
-> ⚠️ **Work in progress** — the t2va pipeline works end-to-end and is numerically validated
-> against the reference implementation, but APIs, CLI flags and performance are still moving.
+> ⚠️ **Work in progress** — text-to-video (`t2va`) and keyframe-conditioned video (`fl2va`) both
+> work end-to-end and are numerically validated against the reference implementation, but APIs,
+> CLI flags and performance are still moving.
 
 Swift MLX port of [MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3) for Apple Silicon:
 **joint video + synchronized stereo audio generation** — one 33B guidance-distilled transformer
 denoises a single packed sequence holding text, audio and video rows at once. 24 fps, 5–15 s,
-768 px short edge, 32 kHz stereo, no CFG, no vocoder.
+768 px short edge, 32 kHz stereo, no CFG, no vocoder. Generate from a prompt, or from a prompt
+plus a first (and/or last) keyframe image.
 
 ## Examples
 
@@ -16,6 +18,16 @@ denoises a single packed sequence holding text, audio and video rows at once. 24
 
 More (including the first 960×544 fox) in [docs/examples/t2va](docs/examples/t2va/README.md).
 
+**Keyframe-conditioned** — a real photograph of a *parked* car, and a prompt telling it to fly.
+It leaves the ground and stays a 2CV: conditioning anchors the scene without freezing it.
+
+| 🚗🕊️ [The flying 2CV — photo in, flight out](docs/examples/fl2va/2cv-fly-576x384.mp4) |
+|---|
+| ![2cv](docs/examples/fl2va/2cv-fly-contact-sheet.png) |
+
+Input image, exact prompt, settings and an honest look at where it breaks down:
+[docs/examples/fl2va](docs/examples/fl2va/README.md).
+
 
 ## Status (August 2026)
 
@@ -23,10 +35,17 @@ More (including the first 960×544 fox) in [docs/examples/t2va](docs/examples/t2
 - Full t2va pipeline: tokenizer → Qwen3-VL-32B conditioner (layers 0–49 only) → 33B
   Omni-Transformer → ViT video VAE (tiled + temporally chunked, fp16) → BigVGAN audio VAE →
   MP4 mux (H.264 + AAC) via AVFoundation
+- **fl2va — keyframe-conditioned generation** (`--image`, `--last-image`): Qwen3-VL vision tower
+  + interleaved 3-axis mrope + deepstack injection for the `<Picture i>` presentation, causal
+  CNN video VAE encoder for the conditioning rows, PIL-exact canvas preparation. The keyframe
+  anchors the loop (noise-augmented at t = 0.999, never updated) while the prompt still drives
+  the action — see [the flying 2CV](docs/examples/fl2va/README.md)
 - Strict sequential loading fits full-precision bf16 in 96 GB unified memory
 - **Numeric parity vs the diffusers reference** (`minimax-h3 parity`, dumps via
   `scripts/parity_reference.py`): audio VAE max|Δ| 5e-6, video VAE 1.3e-5 (fp32) / 1.1e-2 (fp16
-  autocast recipe), packing grid exact (Δ=0), DiT block-0 video & audio velocities at bf16 noise
+  autocast recipe), packing grid exact (Δ=0), DiT block-0 video & audio velocities at bf16 noise,
+  keyframe canvas preparation bit-exact, and the **whole fl2va conditioner at full depth**
+  (`hidden_states[50]`: relative RMS 0.024, cosine 0.9997)
 - Built-in profiling (`--profile`, [swift-mlx-profiler](https://github.com/VincentGourbin/swift-mlx-profiler)):
   console report + Perfetto trace
 - Crash-safe generation: raw frames+audio saved as `.raw.safetensors` before muxing;
@@ -67,9 +86,12 @@ Full methodology and numbers: [docs/knowledge/benchmarks/quantization-2026-08.md
 the prequantized export/load round-trip is validated bit-exact for every mode family.
 
 **Not yet:**
-- fl2va (first/last keyframe): needs the Qwen3-VL vision tower + the causal video VAE encoder
 - ref2va, and the hosted-only H3-Context-IR / H3-Regenerate-2K stages
-- MiniMax's sparse attention (not yet open-sourced) — the real unlock for full 768p speed
+- MiniMax's sparse attention for H3 (still unpublished — their [MSA](https://github.com/MiniMax-AI/MSA)
+  release is SM100 CUDA kernels, so only the algorithm transfers here) — the real unlock for
+  full 768p speed
+- `--last-image` alone (L2VA) and first+last together share the fl2va code path but have not
+  been run end to end yet
 
 ## Requirements
 
@@ -108,6 +130,11 @@ minimax-h3 smoke all
 minimax-h3 generate "A red fox trotting through a snowy pine forest, snow crunching underfoot" \
   -o fox.mp4 --normalize-audio
 
+# Image -> video+audio: the canvas takes the keyframe's aspect ratio, the prompt says what happens
+minimax-h3 generate "The car lifts off and flies above the trees" --image car.jpg -o fly.mp4
+# ...and/or an ending keyframe (alone: generate *up to* it; with --image: interpolate between)
+minimax-h3 generate "..." --image first.jpg --last-image last.jpg -o morph.mp4
+
 # Smaller canvas = much faster per step (multiples of 32). Short edge 768 is the trained
 # regime; smaller trades quality (and ~6 dB of audio level) for speed.
 minimax-h3 generate "..." -W 960 -H 544 -s 30 -o fast.mp4 --profile
@@ -138,8 +165,9 @@ and MiniMax's prompt guides (`docs/` in the HF repo).
 | Component | What | Size (fp) |
 |---|---|---|
 | Conditioner | Qwen3-VL-32B, **unnormalized hidden state after layer 50** (layers 51+ never loaded) | ~52 GB bf16 |
+| Vision tower | Qwen3-VL ViT (27 blocks, deepstack 8/16/24) for `fl2va` keyframes — **bf16, matching the release** | ~0.8 GB bf16 |
 | Omni-Transformer | 33B dense single-stream DiT, per-(timestep, modality) AdaLN, 3-axis MM-RoPE | 61.7 GB bf16 |
-| Video VAE | f16×t4×d24; causal CNN encoder (not yet ported), 36-layer ViT decoder, tiled+chunked | 10.4 GB (fp16 decode) |
+| Video VAE | f16×t4×d24; causal CNN encoder (keyframes) + 36-layer ViT decoder, tiled+chunked | 10.4 GB (fp16 decode) |
 | Audio VAE | DAC encoder (not yet ported) / BigVGAN decoder, mono ×2 for stereo, 40 latents/s | 0.6 GB fp32 |
 
 The packed sequence `[text | keyframe cond | audio | video]` shares one rotary clock between
