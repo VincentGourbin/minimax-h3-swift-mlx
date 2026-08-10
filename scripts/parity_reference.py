@@ -442,8 +442,6 @@ def dump_conditioner_fl2va(models_dir: pathlib.Path) -> None:
     import numpy as np
     from PIL import Image
 
-    from diffusers.modular_pipelines.minimax_h3.packing import prepare_keyframe_image
-
     from transformers import AutoConfig, AutoProcessor, AutoTokenizer
     from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLModel
 
@@ -451,8 +449,12 @@ def dump_conditioner_fl2va(models_dir: pathlib.Path) -> None:
     prompt = "A red fox walking through a snowy forest at dusk, soft wind, distant birdsong."
     canvas_height, canvas_width = 256, 448
 
+    # The geometry anchor is stretched onto the canvas — this IS `prepare_keyframe_image(...,
+    # stretch=True)`, inlined so the probe needs no diffusers checkout (the canvas preparation
+    # itself is covered bit-exactly by the `keyframe-preprocess` probe, which does run against
+    # the reference implementation).
     image = Image.open(keyframe_path).convert("RGB")
-    canvas = prepare_keyframe_image(image, canvas_height, canvas_width, stretch=True)
+    canvas = image.resize((canvas_width, canvas_height), Image.Resampling.LANCZOS)
 
     processor = AutoProcessor.from_pretrained(models_dir, subfolder="processor")
     tokenizer = AutoTokenizer.from_pretrained(models_dir, subfolder="tokenizer")
