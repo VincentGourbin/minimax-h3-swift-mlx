@@ -98,7 +98,7 @@ final class H3RotaryPosEmbed {
 
 /// Rotate the leading `rotaryDim` channels of every head (rotate_half convention), pass the rest.
 /// x is (B, seq, heads, headDim); cos/sin are (seq, rotaryDim).
-func applyH3RotaryEmb(_ x: MLXArray, cos: MLXArray, sin: MLXArray) -> MLXArray {
+public func applyH3RotaryEmb(_ x: MLXArray, cos: MLXArray, sin: MLXArray) -> MLXArray {
     let rotaryDim = cos.dim(-1)
     let xRotary = x[.ellipsis, ..<rotaryDim]
     let xPass = x[.ellipsis, rotaryDim...]
