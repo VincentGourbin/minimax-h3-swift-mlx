@@ -7,3 +7,5 @@
 *.raw.safetensors
 *.trace.json
 .local-runs/
+__pycache__/
+*.pyc
