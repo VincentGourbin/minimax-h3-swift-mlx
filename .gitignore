@@ -6,3 +6,4 @@
 !docs/examples/**/*.mp4
 *.raw.safetensors
 *.trace.json
+.local-runs/
