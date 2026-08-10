@@ -249,6 +249,19 @@ public final class Qwen3VLTextEncoder: Module {
         deepstack: [MLXArray] = [],
         layout: Qwen3VLMultimodalLayout? = nil
     ) -> MLXArray {
+        forward(tokenIds, imageEmbeds: imageEmbeds, deepstack: deepstack, layout: layout).final
+    }
+
+    /// Same forward, optionally keeping the residual stream after the listed layer counts
+    /// (`captureDepths` counts layers applied, matching transformers' `hidden_states[n]`).
+    /// Parity harnesses use it to locate where two implementations start to diverge.
+    public func forward(
+        _ tokenIds: MLXArray,
+        imageEmbeds: MLXArray? = nil,
+        deepstack: [MLXArray] = [],
+        layout: Qwen3VLMultimodalLayout? = nil,
+        captureDepths: Set<Int> = []
+    ) -> (final: MLXArray, captured: [Int: MLXArray]) {
         var x = embedTokens(tokenIds).squeezed(axis: 0)  // (L, hidden)
         if let imageEmbeds, let layout {
             var offset = 0
@@ -261,6 +274,7 @@ public final class Qwen3VLTextEncoder: Module {
         let (cos, sin) = mropeTable(
             positions: layout?.positions, sequenceLength: tokenIds.dim(1))
         x = x.expandedDimensions(axis: 0)
+        var captured = [Int: MLXArray]()
         for (index, layer) in layers.enumerated() {
             x = layer(x, cos: cos, sin: sin)
             if index < deepstack.count, let layout {
@@ -273,7 +287,20 @@ public final class Qwen3VLTextEncoder: Module {
                     offset += run.count
                 }
             }
+            if captureDepths.contains(index + 1) { captured[index + 1] = x }
         }
+        return (x, captured)
+    }
+
+    /// Run a contiguous slice of decoder layers over an already-embedded residual stream
+    /// `(1, L, hidden)`. Parity harnesses feed a reference implementation's intermediate state
+    /// through one layer to separate that layer's arithmetic from accumulated input drift.
+    public func applyLayers(
+        _ hidden: MLXArray, range: Range<Int>, layout: Qwen3VLMultimodalLayout? = nil
+    ) -> MLXArray {
+        let (cos, sin) = mropeTable(positions: layout?.positions, sequenceLength: hidden.dim(1))
+        var x = hidden
+        for index in range { x = layers[index](x, cos: cos, sin: sin) }
         return x
     }
 

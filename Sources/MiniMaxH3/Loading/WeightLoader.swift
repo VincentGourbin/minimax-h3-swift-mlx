@@ -184,7 +184,19 @@ public enum H3WeightLoader {
 extension H3WeightLoader {
     /// Load the Qwen3-VL vision tower (fl2va keyframes) from `<modelDir>/text_encoder`.
     /// The full-patch conv3d patch embedding is reshaped into its equivalent Linear.
-    public static func loadVisionTower(modelDirectory: URL) throws -> Qwen3VLVisionTower {
+    /// - Parameter dtype: **bf16 by default, to match the released pipeline**, which loads the
+    ///   whole conditioner in bf16. Running the tower in fp32 is more accurate *in isolation*
+    ///   (27 pre-LN blocks compound bf16 rounding into ~5 % outliers on the merged embeds) but
+    ///   it feeds the text stack a different trajectory: measured end to end, the fp32 tower
+    ///   drives one image token into a massive activation at decoder layer 43 (18 176 where the
+    ///   reference carries 161) and the conditioning ends at cosine 0.67 from the reference,
+    ///   while the bf16 tower tracks it at cosine 0.9997. Fidelity to the release wins over
+    ///   component-wise accuracy: the diffusion transformer was trained on bf16 conditioning.
+    ///   Pass `.float32` to reproduce the isolated-accuracy measurement (`parity vision-tower`,
+    ///   whose reference dump is fp32).
+    public static func loadVisionTower(
+        modelDirectory: URL, dtype: DType = .bfloat16
+    ) throws -> Qwen3VLVisionTower {
         let directory = modelDirectory.appendingPathComponent("text_encoder")
         let config = try Qwen3VLVisionConfig.load(from: directory.appendingPathComponent("config.json"))
         let model = Qwen3VLVisionTower(config: config)
@@ -198,9 +210,7 @@ extension H3WeightLoader {
         if let pe = weights["patch_embed.weight"] {
             weights["patch_embed.weight"] = pe.reshaped(pe.dim(0), -1)
         }
-        // fp32: the tower is tiny (~0.4B) and runs once per request; 27 pre-LN blocks compound
-        // bf16 rounding into multi-percent outliers on the merged embeds.
-        for (key, value) in weights { weights[key] = value.asType(.float32) }
+        for (key, value) in weights { weights[key] = value.asType(dtype) }
         try apply(weights: weights, to: model, component: "vision_tower")
         return model
     }
