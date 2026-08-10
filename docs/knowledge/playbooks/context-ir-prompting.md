@@ -35,7 +35,7 @@ Rules of thumb:
   audible; name each sound source.
 - `[Shot N]` timecodes (`At 00:04.500`) drive cuts and synchronized audio events.
 - `non_diegetic_music: none` if no score is wanted — omitting the section leaves it to chance.
-- MiniMax's full prompt guides are local: `/Volumes/Lexar/models/MiniMax-H3/docs/
-  VIDEO_PROMPT_WRITING_GUIDE_base_en.md` (and `_ref_en.md`).
+- MiniMax's full prompt guides ship with the checkpoint:
+  `$H3_MODELS_DIR/docs/VIDEO_PROMPT_WRITING_GUIDE_base_en.md` (and `_ref_en.md`).
 - Longer term: build a local Context-IR substitute (e.g. gemma-4-swift-mlx rewriting user
   prompts into this format), like the hosted H3-Context-IR does.

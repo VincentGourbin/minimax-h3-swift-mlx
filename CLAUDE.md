@@ -29,6 +29,11 @@ xcodebuild -scheme minimax-h3 -configuration Release -derivedDataPath .xcodebuil
 `processor/`, `scheduler/`, `audio_scheduler/`. Reference Python sources for the VAEs are in the
 HF repo under `FL2VA/video_vae/*.py` and downloaded alongside.
 
+**This repo is public: never commit a local absolute path.** Write `$H3_MODELS_DIR/...` for
+checkpoint files and repo-relative paths for everything else — no volume names, no home
+directories, in code, docs or knowledge notes. Detached run scripts and their logs live in
+`.local-runs/` (gitignored) precisely so they can carry machine-specific paths.
+
 ## Hardware constraints (M3 Max, 96 GB)
 
 Full-precision bf16 works ONLY with strict sequential stage loading: text encoder (~52 GB truncated

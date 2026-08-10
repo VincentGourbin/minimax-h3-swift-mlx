@@ -57,7 +57,7 @@ shard-wise quantize-during-load to cap the transient without a prequantized file
    encoder for int4, mxfp8, nvfp4: on-the-fly RMS == prequantized-pickup RMS to the last digit;
    layouts differ — affine carries biases, 1251 tensors vs 901 — both handled).
 
-## Loads (Lexar USB SSD, cold-ish)
+## Loads (external USB SSD, cold-ish)
 
 | | bf16 | qint8 prequantized |
 |---|---|---|
