@@ -1,0 +1,7 @@
+For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced.
+
+integrated_multimodal_description: [Shot 1] Cinematic, medium side profile shot, the vibrant red 2CV lifts slowly off the ground, rises above the trees, and flies into the sky, the wheels spinning in mid-air. The camera tracks the vehicle's ascent.
+
+overall_soundscape: The sound of the tires spinning on the gravel fades as the vehicle gains altitude, replaced by the rush of wind as it flies.
+
+non_diegetic_music: A sweeping orchestral score begins as the car lifts, building tension with strings and brass as it ascends into the frame.

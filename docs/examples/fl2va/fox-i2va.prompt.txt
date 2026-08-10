@@ -1,0 +1,7 @@
+For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced.
+
+integrated_multimodal_description: [Shot 1] Live-action, the medium-long shot from the reference image holds, showing the vibrant red fox striding purposefully across the undisturbed white snow. The camera maintains a low angle, tracking the fox's movement from left to right through the wintry woodland edge. The fox's tawny-red coat is richly detailed against the monochrome snow, its muscles tense, tail low, head alert. The background remains the dense screen of snow-dusted evergreen trees, slightly softened by the approaching twilight.
+
+overall_soundscape: The sound of a light wind rustling through the evergreen needles is present. Distant, faint bird calls drift on the air, suggesting the quiet vastness of the snowy woods.
+
+non_diegetic_music: N/A
