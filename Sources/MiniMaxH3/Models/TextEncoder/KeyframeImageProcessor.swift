@@ -35,8 +35,14 @@ public struct H3KeyframeImage: Sendable {
 
     // MARK: - Loading
 
-    /// Decode an image file to RGB with its EXIF orientation applied (PIL `exif_transpose` +
-    /// `convert("RGB")` equivalent; alpha, if any, is dropped, not composited).
+    /// Decode an image file to RGB with its EXIF orientation applied — PIL's `exif_transpose` +
+    /// `convert("RGB")`.
+    ///
+    /// Alpha is *undone*, not composited: PIL keeps an RGBA image's colour channels untouched,
+    /// while Core Graphics only hands back premultiplied pixels, which would darken every
+    /// semi-transparent region and turn transparent ones black. We therefore rasterize with
+    /// premultiplied alpha and divide it back out. A wrong canvas here would feed both the
+    /// vision tower and the VAE conditioning rows.
     public static func load(from url: URL) throws -> H3KeyframeImage {
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
               let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil)
@@ -49,20 +55,35 @@ public struct H3KeyframeImage: Sendable {
         let (width, height) = (cgImage.width, cgImage.height)
         var rgba = [UInt8](repeating: 0, count: width * height * 4)
         let colorSpace = CGColorSpaceCreateDeviceRGB()
-        guard let context = CGContext(
-            data: &rgba, width: width, height: height, bitsPerComponent: 8,
-            bytesPerRow: width * 4, space: colorSpace,
-            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)
-        else {
+        // The context keeps writing through this pointer during `draw`, so both calls must stay
+        // inside the closure — passing `&rgba` to the initializer alone is undefined behaviour.
+        var rasterized = true
+        rgba.withUnsafeMutableBytes { buffer in
+            guard let context = CGContext(
+                data: buffer.baseAddress, width: width, height: height, bitsPerComponent: 8,
+                bytesPerRow: width * 4, space: colorSpace,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+            else {
+                rasterized = false
+                return
+            }
+            context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+        }
+        guard rasterized else {
             throw H3Error.invalidInput("Cannot rasterize image at \(url.path)")
         }
-        context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
 
         var rgb = [UInt8](repeating: 0, count: width * height * 3)
         for pixel in 0..<(width * height) {
-            rgb[pixel * 3] = rgba[pixel * 4]
-            rgb[pixel * 3 + 1] = rgba[pixel * 4 + 1]
-            rgb[pixel * 3 + 2] = rgba[pixel * 4 + 2]
+            let alpha = Int(rgba[pixel * 4 + 3])
+            for channel in 0..<3 {
+                let value = Int(rgba[pixel * 4 + channel])
+                // alpha == 0 carries no colour information; PIL would expose the raw channel,
+                // which Core Graphics has already zeroed, so black is the only answer left.
+                rgb[pixel * 3 + channel] = alpha == 0 || alpha == 255
+                    ? UInt8(value)
+                    : UInt8(min(255, (value * 255 + alpha / 2) / alpha))
+            }
         }
         return H3KeyframeImage(width: width, height: height, pixels: rgb)
             .applyingEXIFOrientation(orientation)

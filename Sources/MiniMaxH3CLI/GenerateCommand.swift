@@ -97,11 +97,37 @@ struct GenerateCommand: AsyncParsableCommand {
         var finalPrompt = prompt
         if enhancePrompt {
             let duration = Double(try H3Geometry.alignNumFrames(frames)) / Double(H3Constants.fps)
-            print("Enhancing prompt (Gemma 4 E4B)…")
-            let enhancer = await ContextIREnhancer()
-            try await enhancer.load(progress: nil)
-            finalPrompt = try await enhancer.enhance(prompt, durationSeconds: duration)
-            await enhancer.unload()
+            // With keyframes, the rewrite MUST see them: the text-only path would emit a T2VA
+            // prompt with no `<Picture i>` reference line while the pipeline builds a vision
+            // block for that same image — prompt and conditioning would describe different
+            // requests, silently.
+            if image != nil || lastImage != nil {
+                let variant: H3EnhanceVariant =
+                    image != nil && lastImage != nil ? .fl2va : image != nil ? .i2va : .l2va
+                print("Enhancing prompt (Gemma 4 E4B, \(variant.rawValue.uppercased()))…")
+                let analyzer = MultimodalContextIR()
+                try await analyzer.load()
+                var imageAnalysis: String?
+                if let image {
+                    imageAnalysis = try await analyzer.describeImage(URL(fileURLWithPath: image))
+                }
+                var lastImageAnalysis: String?
+                if let lastImage {
+                    lastImageAnalysis = try await analyzer.describeImage(
+                        URL(fileURLWithPath: lastImage))
+                }
+                finalPrompt = try await analyzer.rewrite(
+                    request: prompt, durationSeconds: duration, variant: variant,
+                    imageAnalysis: imageAnalysis, lastImageAnalysis: lastImageAnalysis,
+                    audioAnalysis: nil, videoAnalysis: nil)
+                await analyzer.unload()
+            } else {
+                print("Enhancing prompt (Gemma 4 E4B)…")
+                let enhancer = await ContextIREnhancer()
+                try await enhancer.load(progress: nil)
+                finalPrompt = try await enhancer.enhance(prompt, durationSeconds: duration)
+                await enhancer.unload()
+            }
             print("— Context-IR prompt —\n\(finalPrompt)\n———")
             let promptURL = URL(fileURLWithPath: output).deletingPathExtension()
                 .appendingPathExtension("prompt.txt")

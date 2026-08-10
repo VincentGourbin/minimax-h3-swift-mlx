@@ -15,15 +15,23 @@ import MLXNN
 extension H3WeightLoader {
     // MARK: - Video VAE (decode path)
 
-    public static func loadVideoVAE(modelDirectory: URL, includeEncoder: Bool = false) throws -> H3VideoVAE {
+    /// - Parameter includeDecoder: pass `false` for the fl2va keyframe stage, which only
+    ///   encodes — it skips the ~5B-parameter ViT decoder and its ~10 GB read.
+    public static func loadVideoVAE(
+        modelDirectory: URL, includeEncoder: Bool = false, includeDecoder: Bool = true
+    ) throws -> H3VideoVAE {
+        precondition(includeEncoder || includeDecoder, "a VAE with neither half is useless")
         let directory = modelDirectory.appendingPathComponent("vae")
         let config = try H3VideoVAEConfig.load(from: directory.appendingPathComponent("config.json"))
-        let model = H3VideoVAE(config: config, includeEncoder: includeEncoder)
+        let model = H3VideoVAE(
+            config: config, includeEncoder: includeEncoder, includeDecoder: includeDecoder)
 
         var weights = try loadShardedWeights(directory: directory) { key in
             let isEncoderKey = key.hasPrefix("encoder.") || key.hasPrefix("quant_conv.")
-            guard key.hasPrefix("decoder.") || key.hasPrefix("post_quant_conv.")
-                || (includeEncoder && isEncoderKey) else { return nil }
+            let isDecoderKey = key.hasPrefix("decoder.") || key.hasPrefix("post_quant_conv.")
+            guard (includeDecoder && isDecoderKey) || (includeEncoder && isEncoderKey) else {
+                return nil
+            }
             return key
                 .replacingOccurrences(of: ".to_out.0.", with: ".to_out.")
                 .replacingOccurrences(of: ".ff.net.0.proj.", with: ".ff.proj.")
