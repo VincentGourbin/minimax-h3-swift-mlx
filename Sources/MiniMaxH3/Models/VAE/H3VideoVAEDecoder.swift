@@ -290,12 +290,14 @@ public final class H3VideoVAE: Module {
     public var tileSampleMinSize = 256
     public var tileSampleMinOverlap = 64
 
-    @ModuleInfo(key: "post_quant_conv") var postQuantConv: Linear  // 1x1x1 conv3d == channel linear
-    @ModuleInfo(key: "decoder") var decoder: H3VideoViTDecoder
+    @ModuleInfo(key: "post_quant_conv") var postQuantConv: Linear?  // 1x1x1 conv3d == channel linear
+    @ModuleInfo(key: "decoder") var decoder: H3VideoViTDecoder?
     @ModuleInfo(key: "quant_conv") var quantConv: Linear?
     @ModuleInfo(key: "encoder") var encoder: H3VideoEncoder3d?
 
-    public init(config: H3VideoVAEConfig, includeEncoder: Bool = false) {
+    /// - Parameter includeDecoder: the ViT decoder is ~5B parameters. The fl2va keyframe stage
+    ///   only encodes, so it builds the VAE without it and skips a ~10 GB read.
+    public init(config: H3VideoVAEConfig, includeEncoder: Bool = false, includeDecoder: Bool = true) {
         self.config = config
         let ratio = config.temporalCompressionRatio
         framePrePadding = (ratio - config.clipLength % ratio) % ratio
@@ -303,8 +305,9 @@ public final class H3VideoVAE: Module {
         tokenOverlap = (tokensChunkSize - config.tokenDrop % tokensChunkSize) % tokensChunkSize
         frameOverlap = max(tokenOverlap * ratio - framePrePadding, 0)
 
-        _postQuantConv.wrappedValue = Linear(config.latentChannels, config.latentChannels, bias: true)
-        _decoder.wrappedValue = H3VideoViTDecoder(config: config)
+        _postQuantConv.wrappedValue = includeDecoder
+            ? Linear(config.latentChannels, config.latentChannels, bias: true) : nil
+        _decoder.wrappedValue = includeDecoder ? H3VideoViTDecoder(config: config) : nil
         _quantConv.wrappedValue = includeEncoder
             ? Linear(2 * config.latentChannels, 2 * config.latentChannels, bias: true) : nil
         _encoder.wrappedValue = includeEncoder ? H3VideoEncoder3d(config: config) : nil
@@ -410,6 +413,9 @@ public final class H3VideoVAE: Module {
 
     /// Decode one temporal clip, spatially tiled. z (1, C, F, hLat, wLat).
     func decodeClip(_ z: MLXArray) -> MLXArray {
+        guard let postQuantConv, let decoder else {
+            preconditionFailure("VAE was loaded without its decoder (includeDecoder: false)")
+        }
         let projected = postQuantConv(z.transposed(0, 2, 3, 4, 1)).transposed(0, 4, 1, 2, 3)
         if !useTiling { return decoder(projected) }
 
@@ -463,6 +469,9 @@ public final class H3VideoVAE: Module {
         let temporalRatio = config.temporalCompressionRatio
         let chunkNumFrames = tokensChunkSize * temporalRatio
 
+        guard let postQuantConv else {
+            preconditionFailure("VAE was loaded without its decoder (includeDecoder: false)")
+        }
         // Follow the weights' compute dtype (fp16 per the released autocast recipe) — a fp32
         // input would silently promote every matmul back to fp32.
         var z = z.asType(postQuantConv.weight.dtype)

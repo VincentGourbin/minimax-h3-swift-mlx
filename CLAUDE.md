@@ -22,6 +22,22 @@ xcodebuild -scheme minimax-h3 -configuration Release -derivedDataPath .xcodebuil
 
 `swift build` is fine for compile checks only.
 
+## Tests
+
+```bash
+# Everything that needs no checkpoint (geometry, mrope layout, presentation, patchify): ~0.4 s
+xcodebuild test -scheme minimax-h3 -destination 'platform=macOS' -derivedDataPath .xcodebuild
+
+# Plus the checkpoint-backed smoke tier. `xcodebuild test` does NOT forward the environment,
+# so run the bundle directly or the suite silently skips:
+xcodebuild build-for-testing -scheme minimax-h3 -destination 'platform=macOS' -derivedDataPath .xcodebuild
+H3_MODELS_DIR=... xcrun xctest .xcodebuild/Build/Products/Debug/MiniMaxH3Tests.xctest
+```
+
+`swift test` runs the pure-Swift tests then dies on the metallib as soon as MLX is touched.
+Keep the two tiers separate: anything needing weights goes in `SmokeTests.swift` behind the
+`H3_MODELS_DIR` gate, so a contributor without the 163 GB download still gets a green suite.
+
 ## Model weights
 
 `$H3_MODELS_DIR` (diffusers layout, e.g. an external SSD): `transformer/` (61.7 GB bf16),

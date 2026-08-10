@@ -67,7 +67,8 @@ public final class H3Pipeline {
 
     /// Encode the presentation: the verbatim prompt for t2va; per-keyframe `"<Picture i>: "`
     /// labels + vision blocks first for fl2va (keyframes already prepared onto the canvas).
-    /// The vision tower (0.4B fp32) runs and is freed before the 52 GB text stack loads.
+    /// The vision tower (0.4B, bf16 to match the release — see `loadVisionTower`) runs and is
+    /// freed before the 52 GB text stack loads.
     func encodePrompt(
         _ prompt: String, keyframes: [H3KeyframeImage] = [], quantization: H3Quantization
     ) async throws -> (embeds: MLXArray, tags: [Int32]) {
@@ -144,8 +145,10 @@ public final class H3Pipeline {
         let profiler = H3Profiler.shared
         report("Encoding \(keyframes.count) keyframe(s) (video VAE)")
         profiler.start("Keyframe VAE Encode")
+        // Encoder only: this stage never decodes, and the ViT decoder is ~5 GB of dead weight
+        // here — the decode stage loads its own copy once the transformer is gone.
         var vae: H3VideoVAE? = try H3WeightLoader.loadVideoVAE(
-            modelDirectory: modelDirectory, includeEncoder: true)
+            modelDirectory: modelDirectory, includeEncoder: true, includeDecoder: false)
         let latentsMean = MLXArray(vae!.config.latentsMean).reshaped(1, -1, 1, 1, 1)
         let latentsStd = MLXArray(vae!.config.latentsStd).reshaped(1, -1, 1, 1, 1)
         let pixelMean = MLXArray(H3Constants.pixelMean).reshaped(1, -1, 1, 1, 1)

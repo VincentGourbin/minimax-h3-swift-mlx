@@ -224,7 +224,7 @@ struct ParityCommand: AsyncParsableCommand {
                 // at depth 42. If one cell's few-percent difference is enough to blow the output
                 // up, the knife-edge belongs to the model, not to either implementation.
                 if let mine42 = captured[42] {
-                    var perturbed = seed.asType(.bfloat16)
+                    let perturbed = seed.asType(.bfloat16)
                     perturbed[0, probeRow, probeColumn] =
                         mine42[0, probeRow, probeColumn].asType(.bfloat16)
                     let out = encoder.applyLayers(perturbed, range: 42..<44, layout: layout)

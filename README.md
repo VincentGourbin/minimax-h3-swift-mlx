@@ -120,6 +120,19 @@ xcodebuild -scheme minimax-h3 -configuration Release \
 alias minimax-h3=$PWD/.xcodebuild/Build/Products/Release/minimax-h3
 ```
 
+## Tests
+
+```bash
+# No checkpoint needed — geometry, interleaved-mrope layout, presentation tagging,
+# canvas preparation, block-major patchify, packed sequence. ~0.4 s.
+xcodebuild test -scheme minimax-h3 -destination 'platform=macOS' -derivedDataPath .xcodebuild
+
+# With the weights: also loads the audio VAE, the video VAE encoder and the vision tower.
+# `xcodebuild test` does not forward the environment, so run the bundle directly.
+xcodebuild build-for-testing -scheme minimax-h3 -destination 'platform=macOS' -derivedDataPath .xcodebuild
+H3_MODELS_DIR=... xcrun xctest .xcodebuild/Build/Products/Debug/MiniMaxH3Tests.xctest
+```
+
 ## Usage
 
 ```bash
