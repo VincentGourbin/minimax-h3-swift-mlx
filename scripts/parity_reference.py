@@ -431,9 +431,79 @@ def dump_text_layer0_mm(models_dir: pathlib.Path) -> None:
     print("text-layer0-mm:", len(token_ids), "tokens,", tuple(out.shape), "rms", out.pow(2).mean().sqrt().item())
 
 
+def dump_conditioner_fl2va(models_dir: pathlib.Path) -> None:
+    """Full-depth fl2va conditioner: a real keyframe + prompt through the vision tower and the
+    text stack to hidden_states[50], everything in the release's bf16.
+
+    HEAVY: loads 51 decoder layers (~53 GB) on CPU — run it alone. The stack is truncated to 51
+    layers because `hidden_states[50]` is the *input* of layer index 50 (output of layer 49),
+    which stays unnormalized only while at least one layer follows it.
+    """
+    import numpy as np
+    from PIL import Image
+
+    from diffusers.modular_pipelines.minimax_h3.packing import prepare_keyframe_image
+
+    from transformers import AutoConfig, AutoProcessor, AutoTokenizer
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLModel
+
+    keyframe_path = pathlib.Path(__file__).resolve().parent.parent / "docs/examples/t2va/fox-frame.png"
+    prompt = "A red fox walking through a snowy forest at dusk, soft wind, distant birdsong."
+    canvas_height, canvas_width = 256, 448
+
+    image = Image.open(keyframe_path).convert("RGB")
+    canvas = prepare_keyframe_image(image, canvas_height, canvas_width, stretch=True)
+
+    processor = AutoProcessor.from_pretrained(models_dir, subfolder="processor")
+    tokenizer = AutoTokenizer.from_pretrained(models_dir, subfolder="tokenizer")
+    batch = processor.image_processor(images=[canvas], return_tensors="pt")
+    pixel_values, grid_thw = batch["pixel_values"], batch["image_grid_thw"]
+
+    num_image_tokens = int(grid_thw[0].prod()) // processor.image_processor.merge_size**2
+    token_ids = tokenizer("<Picture 1>: ", add_special_tokens=False)["input_ids"]
+    token_ids += (
+        [tokenizer.convert_tokens_to_ids("<|vision_start|>")]
+        + [tokenizer.convert_tokens_to_ids("<|image_pad|>")] * num_image_tokens
+        + [tokenizer.convert_tokens_to_ids("<|vision_end|>")]
+    )
+    token_ids += tokenizer(prompt, add_special_tokens=False)["input_ids"]
+    input_ids = torch.tensor([token_ids])
+    mm_token_type_ids = torch.tensor(processor.create_mm_token_type_ids([token_ids]))
+
+    config = AutoConfig.from_pretrained(models_dir, subfolder="text_encoder")
+    config.text_config.num_hidden_layers = 51
+    model = Qwen3VLModel.from_pretrained(
+        models_dir, subfolder="text_encoder", config=config, dtype=torch.bfloat16
+    ).eval()
+    with torch.no_grad():
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=torch.ones_like(input_ids),
+            mm_token_type_ids=mm_token_type_ids,
+            pixel_values=pixel_values.to(torch.bfloat16),
+            image_grid_thw=grid_thw,
+            use_cache=False,
+            output_hidden_states=True,
+        )
+    hidden = outputs.hidden_states[50]
+    save_file(
+        {
+            "canvas": torch.from_numpy(np.asarray(canvas)),
+            "token_ids": input_ids,
+            "grid_thw": grid_thw,
+            "hidden_50": hidden.float().contiguous(),
+        },
+        out_dir(models_dir) / "conditioner_fl2va.safetensors",
+    )
+    print(
+        "conditioner-fl2va:", len(token_ids), "tokens,", tuple(hidden.shape),
+        "rms", hidden.float().pow(2).mean().sqrt().item(),
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("component", choices=["audio-vae", "video-vae", "video-vae-encode", "vision-tower", "text-layer0", "dit-block0", "keyframe-preprocess", "text-layer0-mm"])
+    parser.add_argument("component", choices=["audio-vae", "video-vae", "video-vae-encode", "vision-tower", "text-layer0", "dit-block0", "keyframe-preprocess", "text-layer0-mm", "conditioner-fl2va"])
     parser.add_argument("--models-dir", default=os.environ.get("H3_MODELS_DIR", "/tmp/MiniMax-H3"))
     args = parser.parse_args()
     models_dir = pathlib.Path(args.models_dir)
@@ -446,6 +516,7 @@ def main() -> None:
         "dit-block0": dump_dit_block0,
         "keyframe-preprocess": dump_keyframe_preprocess,
         "text-layer0-mm": dump_text_layer0_mm,
+        "conditioner-fl2va": dump_conditioner_fl2va,
     }[args.component](models_dir)
 
 
