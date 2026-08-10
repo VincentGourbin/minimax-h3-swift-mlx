@@ -488,15 +488,17 @@ def dump_conditioner_fl2va(models_dir: pathlib.Path) -> None:
             output_hidden_states=True,
         )
     hidden = outputs.hidden_states[50]
-    save_file(
-        {
-            "canvas": torch.from_numpy(np.asarray(canvas)),
-            "token_ids": input_ids,
-            "grid_thw": grid_thw,
-            "hidden_50": hidden.float().contiguous(),
-        },
-        out_dir(models_dir) / "conditioner_fl2va.safetensors",
-    )
+    # Intermediate depths too: a bug shows up as a jump at one layer, compounding bf16 rounding
+    # as a smooth exponential ramp. Cheap — the forward already computed them.
+    tensors = {
+        "canvas": torch.from_numpy(np.asarray(canvas)),
+        "token_ids": input_ids,
+        "grid_thw": grid_thw,
+        "hidden_50": hidden.float().contiguous(),
+    }
+    for depth in (1, 2, 3, 4, 5, 10, 20, 30, 40, 42, 44, 45, 46, 47, 48, 49):
+        tensors[f"hidden_{depth}"] = outputs.hidden_states[depth].float().contiguous()
+    save_file(tensors, out_dir(models_dir) / "conditioner_fl2va.safetensors")
     print(
         "conditioner-fl2va:", len(token_ids), "tokens,", tuple(hidden.shape),
         "rms", hidden.float().pow(2).mean().sqrt().item(),

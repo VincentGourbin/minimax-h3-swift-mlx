@@ -58,9 +58,13 @@ struct ParityCommand: AsyncParsableCommand {
             try compare(ours: moments, reference: reference["moments"]!, name: "moments")
 
         case "vision-tower":
+            // Isolated accuracy: the reference dump runs the tower in fp32, so this probe does
+            // too. Production loads it in bf16 to match the released pipeline end to end — see
+            // `loadVisionTower` and the `conditioner-fl2va` probe.
             let reference = try loadArrays(
                 url: parityDir.appendingPathComponent("vision_tower.safetensors"))
-            let tower = try H3WeightLoader.loadVisionTower(modelDirectory: directory)
+            let tower = try H3WeightLoader.loadVisionTower(
+                modelDirectory: directory, dtype: .float32)
             let grid = reference["grid_thw"]!.asType(.int32)
             let (embeds, deepstack) = tower(
                 reference["pixel_values"]!,
@@ -124,7 +128,10 @@ struct ParityCommand: AsyncParsableCommand {
                 reference: reference["position_ids"]!.asType(.float32),
                 name: "mrope positions")
 
-            let tower = try H3WeightLoader.loadVisionTower(modelDirectory: directory)
+            // fp32 tower here too: this probe's reference dump builds the tower in fp32 and the
+            // point is to isolate layer 0's arithmetic, not to reproduce the release's dtypes.
+            let tower = try H3WeightLoader.loadVisionTower(
+                modelDirectory: directory, dtype: .float32)
             let (imageEmbeds, deepstack) = tower(patches, gridH: gridH, gridW: gridW)
             let encoder = try H3WeightLoader.loadTextEncoder(modelDirectory: directory, numLayers: 1)
             // The reference dump runs fp32; cast the single layer to fp32 too so the check
@@ -162,14 +169,74 @@ struct ParityCommand: AsyncParsableCommand {
                 name: "presentation token ids")
             let layout = try presentation.multimodalLayout()!
 
-            let tower = try H3WeightLoader.loadVisionTower(modelDirectory: directory)
+            // Both the reference and production run the tower in bf16; `--quant fp32-tower`
+            // reproduces the measurement that made fp32 look preferable in isolation, and shows
+            // how it derails the deep trajectory.
+            let towerDType: DType = quant == "fp32-tower" ? .float32 : .bfloat16
+            let tower = try H3WeightLoader.loadVisionTower(
+                modelDirectory: directory, dtype: towerDType)
             let (imageEmbeds, deepstack) = tower(patches, gridH: gridH, gridW: gridW)
             let encoder = try H3WeightLoader.loadTextEncoder(modelDirectory: directory)
-            let hidden = encoder(
+            let depths = [1, 2, 3, 4, 5, 10, 20, 30, 40, 42, 44, 45, 46, 47, 48, 49]
+            let (hidden, captured) = encoder.forward(
                 MLXArray(presentation.tokenIds).expandedDimensions(axis: 0),
                 imageEmbeds: imageEmbeds,
                 deepstack: deepstack,
-                layout: layout)
+                layout: layout,
+                captureDepths: Set(depths))
+
+            // Depth profile: a bug jumps at one layer, bf16 rounding ramps smoothly. The last
+            // two columns track the cell that dominates the final error, in both runs.
+            let (probeRow, probeColumn) = (32, 731)
+            print("depth   rel RMS      cosine       max|Δ|      RMS ours/ref     cell(32,731) ours/ref")
+            for depth in depths {
+                guard let mine = captured[depth],
+                      let theirs = reference["hidden_\(depth)"] else { continue }
+                let a = mine.asType(.float32)
+                let b = theirs.asType(.float32)
+                let d = a - b
+                let rms = { (t: MLXArray) in sqrt(mean(t * t)).item(Float.self) }
+                let cos = (sum(a * b) / (sqrt(sum(a * a)) * sqrt(sum(b * b)))).item(Float.self)
+                print(String(
+                    format: "%5d   %-11.5g  %-11.6f  %-10.4g  %.4g / %.4g     %.5g / %.5g",
+                    depth, rms(d) / rms(b), cos, abs(d).max().item(Float.self), rms(a), rms(b),
+                    a[0, probeRow, probeColumn].item(Float.self),
+                    b[0, probeRow, probeColumn].item(Float.self)))
+            }
+
+            // Decisive test: feed the REFERENCE's own state at depth 42 through our layers 42-43.
+            // Matching here means our arithmetic is right and the depth-50 gap is accumulated
+            // input drift amplified by the model; exploding here means those layers are wrong.
+            if let seed = reference["hidden_42"], let target = reference["hidden_44"] {
+                let replayed = encoder.applyLayers(
+                    seed.asType(.bfloat16), range: 42..<44, layout: layout).asType(.float32)
+                let goal = target.asType(.float32)
+                let d = replayed - goal
+                let rel = (sqrt(mean(d * d)) / sqrt(mean(goal * goal))).item(Float.self)
+                print(String(
+                    format: "replay 42->44 from the reference's own state: rel RMS %.5g  max|Δ| %.4g"
+                        + "  cell(32,731) %.5g vs %.5g",
+                    rel, abs(d).max().item(Float.self),
+                    replayed[0, probeRow, probeColumn].item(Float.self),
+                    goal[0, probeRow, probeColumn].item(Float.self)))
+
+                // Same replay, but with that single cell nudged to the value our own run carried
+                // at depth 42. If one cell's few-percent difference is enough to blow the output
+                // up, the knife-edge belongs to the model, not to either implementation.
+                if let mine42 = captured[42] {
+                    var perturbed = seed.asType(.bfloat16)
+                    perturbed[0, probeRow, probeColumn] =
+                        mine42[0, probeRow, probeColumn].asType(.bfloat16)
+                    let out = encoder.applyLayers(perturbed, range: 42..<44, layout: layout)
+                    print(String(
+                        format: "same replay, cell(32,731) nudged %.5g -> %.5g: output %.5g "
+                            + "(unperturbed run gave %.5g)",
+                        goal[0, probeRow, probeColumn].item(Float.self),
+                        mine42[0, probeRow, probeColumn].asType(.float32).item(Float.self),
+                        out.asType(.float32)[0, probeRow, probeColumn].item(Float.self),
+                        replayed[0, probeRow, probeColumn].item(Float.self)))
+                }
+            }
 
             let ours = hidden.asType(.float32)
             let ref = reference["hidden_50"]!.asType(.float32)
@@ -177,6 +244,31 @@ struct ParityCommand: AsyncParsableCommand {
                 throw H3Error.generationFailed("hidden: shape \(ours.shape) vs \(ref.shape)")
             }
             let difference = ours - ref
+            // Where does the error live? Qwen stacks grow "massive activations" — a couple of
+            // (token, channel) cells worth thousands — and a single mismatched cell can dominate
+            // an RMS built over 700k elements. Print the worst cells, then the metric with them
+            // excluded, so the two failure modes stay distinguishable.
+            let flatDiff = abs(difference).reshaped(-1)
+            let order = argSort(flatDiff)
+            let width = ours.dim(-1)
+            print("worst cells (token, channel): ours vs ref")
+            for rank in 0..<5 {
+                let flatIndex = Int(order[order.dim(0) - 1 - rank].item(Int32.self))
+                let (row, column) = (flatIndex / width, flatIndex % width)
+                print(String(
+                    format: "  (%3d, %4d)  ours %-12.6g ref %-12.6g  Δ %.4g",
+                    row, column,
+                    ours[0, row, column].item(Float.self),
+                    ref[0, row, column].item(Float.self),
+                    flatDiff[flatIndex].item(Float.self)))
+            }
+            let sorted = MLX.sorted(flatDiff)
+            let cutoff = sorted[sorted.dim(0) - 5].item(Float.self)
+            let masked = MLX.where(flatDiff .< cutoff, flatDiff, MLXArray(Float(0)))
+            print(String(
+                format: "rel RMS excluding those 5 cells: %.5g",
+                (sqrt(mean(masked * masked)) / sqrt(mean(ref * ref))).item(Float.self)))
+
             let relRMS = (sqrt(mean(difference * difference))
                 / sqrt(mean(ref * ref))).item(Float.self)
             let cosine = (sum(ours * ref)
