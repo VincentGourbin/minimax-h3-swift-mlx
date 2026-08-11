@@ -42,33 +42,39 @@ checkpoint needed: the shapes decide the cost. Machine not strictly idle — tre
   exactly the sum of its parts (75.8 vs 75.5 s), so there is no allocator or glue overhead
   hiding between the primitives.
 
-## The open question
+## The gap that wasn't
 
-At 8 998 tokens the blocks explain only **47 % of the measured step** (75.8 of 162 s). The gap is
-~85 s and it does *not* scale with sequence length, so it is a fixed per-step cost outside the
-transformer blocks. At the full canvas the same fixed term is a rounding error, which is why it
-never showed up before.
+At 8 998 tokens the blocks first appeared to explain only 47 % of the measured step (75.8 of
+162 s), suggesting a fixed ~85 s living outside them. The obvious suspect was streaming 18.5 GB
+of distinct quantized weights per step, which the bench never pays because it reuses one hot set.
 
-Prime suspect: streaming 18.5 GB of distinct quantized weights every step, which the bench never
-pays (it reuses one set of weights, kept hot). Supporting evidence: at 3.7k tokens the repo's own
-quantization benchmark has int4 (9.5 GB of weights) *faster* than qint8 (18.5 GB) — 23.6 vs
-28.0 s — where compute is nearly identical. Contradicting evidence: bf16 (62 GB) is only 11 %
-slower than qint8 there, which pure streaming cannot explain.
+**Measured, and refuted** (`bench --weight-sets 12`): running the same arithmetic over twelve
+*distinct* weight sets costs **0.5 % more** than reusing one — 0.01 s per block, about **1 s per
+step**. Weight traffic is not a cost here. (Consistent with the older quantization benchmark's
+awkward pair of facts: int4 beat qint8 by 4.4 s at 3.7k tokens while bf16, three times heavier
+than qint8, was only 11 % slower. Neither is a streaming signature.)
 
-**Decisive experiment, not yet run**: time the composed block over N *distinct* weight sets versus
-one set reused N times, same compute either way. If distinct is much slower, the fixed cost is
-memory traffic and more aggressive quantization attacks it directly.
+What remains is not a mystery, it is **measurement uncertainty on the reference figures**. The
+162 s/step came from the 2CV run while Teams and a Parallels VM were competing for the machine —
+the same run's early steps measured 270 s. The bench itself varies ~30 % between compositions of
+the same work. So the "gap" is within the noise of both sides, and there is nothing to chase.
+
+**Before optimizing anything, produce one clean reference**: a short profiled run on a strictly
+idle machine (`generate --profile`), which the repo's own benchmark methodology already demands.
+Optimizing against a number measured under contention is how phantom targets get chased.
 
 ## Ranked opportunities
 
-1. **Settle the fixed ~85 s** (experiment above). At 576×384 it is *half the step* — a bigger
-   lever than anything inside the blocks at that size, and int4 would halve it if it is streaming.
-2. **Fewer sigma steps** — zero code risk, saving exactly linear in steps. 30 → 20 is −33 % of a
-   run. Needs a quality comparison at equal seed, which is cheap to produce.
-3. **Sparse attention** — up to ~2× at 768p by this measurement, not 6×. Still the largest
-   single lever at the full canvas, but the payoff is half what plan 405 assumed, against a
-   substantial implementation cost (the released MSA kernels are CUDA-only; only the algorithm
-   transfers).
+1. **Get one clean reference step** (idle machine, `--profile`). Cheap, and everything below is
+   judged against it. Two of this document's three surprises came from comparing against numbers
+   measured under load.
+2. **Fewer sigma steps** — zero code risk, saving exactly linear in steps: 30 → 20 is −33 % of a
+   run. Needs only a same-seed quality comparison, which the CLI can already produce.
+3. **Sparse attention** — up to ~2× at 768p by this measurement, not 6×, and nothing at small
+   canvases (18 % of block compute there). Still the largest single lever at the full canvas,
+   but against a substantial implementation cost: the released MSA kernels are CUDA-only, so
+   only the algorithm transfers.
 4. **Fuse the elementwise glue** — at 39 930 tokens the composed block costs 16 % more than the
-   sum of its primitives; some of that is fusable. Modest and safe, but only worth it after 1-3.
-5. **Nothing else in the block is worth touching**: see "bookkeeping is noise" above.
+   sum of its primitives; part of that is fusable. Modest and safe, worth it only after 1-3.
+5. **Nothing else in the block is worth touching**: rotary, AdaLN gathers and RMSNorm are ~1 %,
+   transposed views into SDPA cost nothing, weight traffic costs nothing.

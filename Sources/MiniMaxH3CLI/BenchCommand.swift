@@ -33,6 +33,9 @@ struct BenchCommand: AsyncParsableCommand {
     @Option(name: .long, help: "Measured seconds per step, to express results as a share of it.")
     var stepSeconds: Double = 1081
 
+    @Option(name: .long, help: "Also run the distinct-weights experiment with N weight sets (0 = skip).")
+    var weightSets: Int = 0
+
     func run() async throws {
         let config = H3TransformerConfig()
         let (hidden, heads, headDim) = (config.hiddenSize, config.numAttentionHeads, config.attentionHeadDim)
@@ -163,6 +166,69 @@ struct BenchCommand: AsyncParsableCommand {
             let gated = ffProj(ffInput)
             let halves = gated.split(parts: 2, axis: -1)
             return h + modulation[5] * ffOut(halves[0] * sigmoid(halves[1]))
+        }
+
+        // 5. The decisive experiment for the cost that lives outside the blocks: the same
+        // arithmetic, run over N DISTINCT weight sets versus one set reused N times. Identical
+        // FLOPs either way — only the weight traffic differs. If distinct is markedly slower,
+        // a step is partly paying to stream the transformer's weights, and narrower
+        // quantization attacks that directly.
+        if weightSets > 0 {
+            print("\nDistinct-weights experiment (\(weightSets) sets, identical arithmetic):")
+            struct WeightSet {
+                let qkv: [any UnaryLayer]
+                let out: any UnaryLayer
+                let ffProj: any UnaryLayer
+                let ffOut: any UnaryLayer
+            }
+            let sets = (0..<weightSets).map { _ in
+                WeightSet(
+                    qkv: (0..<3).map { _ in linear(hidden, innerDim) },
+                    out: linear(innerDim, hidden),
+                    ffProj: linear(hidden, config.ffnDim * 2),
+                    ffOut: linear(config.ffnDim, hidden))
+            }
+            eval(sets.flatMap { [$0.out, $0.ffProj, $0.ffOut] + $0.qkv }.map { ($0 as! Module).parameters() })
+
+            func oneBlock(_ set: WeightSet) -> MLXArray {
+                var q = set.qkv[0](x).reshaped(1, tokens, heads, headDim)
+                var k = set.qkv[1](x).reshaped(1, tokens, heads, headDim)
+                let v = set.qkv[2](x).reshaped(1, tokens, heads, headDim)
+                q = applyH3RotaryEmb(q, cos: cosTable, sin: sinTable)
+                k = applyH3RotaryEmb(k, cos: cosTable, sin: sinTable)
+                let attended = MLXFast.scaledDotProductAttention(
+                    queries: q.transposed(0, 2, 1, 3), keys: k.transposed(0, 2, 1, 3),
+                    values: v.transposed(0, 2, 1, 3),
+                    scale: 1.0 / Float(headDim).squareRoot(), mask: nil)
+                let projected = set.out(
+                    attended.transposed(0, 2, 1, 3).reshaped(1, tokens, heads * headDim))
+                let gated = set.ffProj(x + projected)
+                let halves = gated.split(parts: 2, axis: -1)
+                return set.ffOut(halves[0] * sigmoid(halves[1]))
+            }
+
+            func time(_ label: String, _ body: () -> Void) -> Double {
+                body()  // warmup
+                let start = Date()
+                body()
+                let elapsed = Date().timeIntervalSince(start)
+                print(String(format: "  %-34@ %8.2f s for %d blocks (%.2f s/block)",
+                             label as NSString, elapsed, weightSets, elapsed / Double(weightSets)))
+                Memory.clearCache()
+                return elapsed
+            }
+
+            let reused = time("one weight set, reused") {
+                for _ in 0..<weightSets { eval(oneBlock(sets[0])) }
+            }
+            let distinct = time("distinct weight sets") {
+                for set in sets { eval(oneBlock(set)) }
+            }
+            let perBlockPenalty = (distinct - reused) / Double(weightSets)
+            print(String(
+                format: "  => streaming penalty %.1f%%, i.e. %.2f s/block -> %.0f s per %d-block step",
+                100 * (distinct - reused) / reused, perBlockPenalty,
+                perBlockPenalty * Double(blocks), blocks))
         }
 
         // MARK: - Report
