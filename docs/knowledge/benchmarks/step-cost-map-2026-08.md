@@ -151,6 +151,11 @@ frame by frame:
   reading. The audio scheduler's shift-3 grid loses proportionally more of its low-σ tail than
   the video's shift-12 grid does.
 
+- **Motion: 15 is out.** Human review of the moving video found visible judder at 15 points —
+  an artifact stills can never catch, which is why the frame grid above looked clean. Frame-level
+  comparison is necessary but NOT sufficient: motion smoothness must be judged on the playing
+  video. Together with the 10 dB audio drop, 15 points is rejected outright.
+
 **Recommendation: 20 sigma points as the practical default** — a third off every run against
-the 30 the quality runs used (and 60 % off the CLI's old default of 50), with video and audio
-both holding. Treat 15 as a video-only fast mode until its audio is listened to.
+the 30 the quality runs used (and 60 % off the CLI's old default of 50), video, motion and
+audio all holding at the reviewer's eye. 15 is rejected (judder + audio).
