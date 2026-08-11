@@ -78,6 +78,62 @@ scene below. H3 mixes faithfully to what the prompt describes — quiet scenes d
 
 ---
 
+## The launch — a sound event landing on its timecode
+
+The flight above already showed that the prompt wins over the image. This one asks a harder
+question: can a *choreography* be placed on a clock — a long hover, a violent departure, and a
+detonation that has to land on the departure and not a second later? And can identity survive
+14.4 seconds, three times longer than anything else here?
+
+### Prompt
+
+Same keyframe. Written as one French sentence, rewritten by the local Gemma 4 stage, then
+corrected by hand on two points that would have sabotaged the test:
+
+- Gemma read the car as a *Volkswagen Beetle*. Left alone, the prompt would have described a
+  Beetle while the conditioning rows carried a 2CV — the two halves of the request pulling
+  apart. Corrected to "vintage Citroën 2CV".
+- It emitted no timecodes. Timecodes are what tie an audio event to an instant in H3's
+  Context-IR, so the whole point of the test was missing. Added by hand.
+
+The result is [`2cv-launch.prompt.txt`](2cv-launch.prompt.txt): lift-off at 00:01.000, stationary
+hover from 00:02.500 to 00:07.000, launch at **00:07.500** with the twin fire trails, then six
+seconds on the empty gravel while they burn out — and, in the soundscape section, the missile
+detonation anchored to that same 00:07.500.
+
+```bash
+minimax-h3 generate "$(cat 2cv-launch.prompt.txt)" --image 2cv-input.jpg \
+  -W 576 -H 384 -f 345 -s 30 --seed 0 \
+  --transformer-quant qint8 --text-encoder-quant qint8 -o 2cv-launch.mp4
+```
+
+### Result
+
+▶ [2cv-launch-576x384-14s.mp4](2cv-launch-576x384-14s.mp4) — 576×384, **345 frames (14.375 s,
+the longest H3 accepts)**, 29 sigma steps, 24 005 packed rows, 3 h 15 on an M3 Max.
+
+![frames at 5 s / 7.5 s / 8.3 s / 13.7 s](2cv-launch-contact-sheet.png)
+
+At 5 s the 2CV hovers, still unmistakably itself — same stickers on the rear quarter window, same
+chrome hubcaps as the photograph, eleven seconds of generation later. At 7.5 s it tears away,
+motion-blurred, flame already jetting. At 8.3 s only the horizontal fire trails remain. At 13.7 s
+the gravel is empty and the hedge intact.
+
+**The audio lands where it was asked to.** Peak level per second:
+
+| 0 s | 4 s | **7 s** | 8 s | 9 s | 12 s |
+|---|---|---|---|---|---|
+| −31 dB | −44 dB | **−1.6 dB** | −5.2 dB | −9.5 dB | −24.7 dB |
+
+A 43 dB jump from the hover to the detonation, inside the very second the timecode named. The
+rotary clock shared between the audio and video rows — the thing that makes this port's packing
+non-negotiable — is doing exactly its job.
+
+This also answers the two questions the shorter clips left open: coherence holds over 14 seconds,
+and the scene ends cleanly instead of dissolving, unlike the first 2CV flight above.
+
+---
+
 ## Fox — quality run at the full canvas
 
 ![frame](fox-i2va-frame.png)

@@ -57,9 +57,26 @@ So the bench slightly *over*states the real cost, and the "gap" analysed below n
 Phase split of that short run: denoising 68 % (GPU 74 %), VAE decode 16 % (GPU 49 %), transformer
 load 7.5 %, peak MLX 34.4 GB.
 
-**New quantified target**: the GPU sits at **74 %** during denoising. The missing quarter is
-launch gaps and unfused elementwise work between kernels — a real, bounded ~18 % that fusing the
-block's glue could recover, without touching the math.
+**GPU utilization**: 74 % during denoising at this size. The missing quarter is launch gaps and
+unfused elementwise work between kernels.
+
+### Second clean point — and it moves the conclusion
+
+`generate -W 576 -H 384 -f 345 -s 30 --profile` (24 005 tokens, the longest clip H3 accepts):
+**401 s/step, σ 16.5 s** over 29 steps, denoising 97 % of the run, **GPU 92 %**, peak MLX 34.4 GB.
+
+Two things follow, and both correct what is written above:
+
+1. **The elementwise-fusion lever shrinks as the canvas grows.** GPU occupancy goes 74 % → 92 %
+   between 9 k and 24 k tokens: the kernels get big enough to hide the launch gaps by themselves.
+   Fusing the block's glue is worth ~18 % at 576×384/124f and only ~8 % at the long clip. It is a
+   *small-canvas* optimization, not a general one.
+2. **Cost grows as roughly tokens^1.9 in this range** (×2.67 tokens → ×6.38 time), close to
+   quadratic and much steeper than "quadratic attention plus linear everything else" predicts
+   (that model said 209 s; reality said 401 s). Estimates made from the primitive breakdown
+   therefore *understate* large runs by about 2×. Use the measured exponent for projections until
+   the discrepancy is understood — attention's real share at large sizes is probably higher than
+   the bench's 49 %.
 
 ## The gap that wasn't
 
@@ -87,9 +104,10 @@ Optimizing against a number measured under contention is how phantom targets get
 1. **Fewer sigma steps** — zero code risk, saving exactly linear in steps: 30 → 20 is −33 % of a
    run. Needs only a same-seed quality comparison, which the CLI can already produce. Nothing
    below is this cheap.
-2. **Close the GPU-utilization gap** — 74 % during denoising means ~18 % is recoverable by
-   fusing the block's elementwise glue (AdaLN affine, gates, residuals) so the GPU stops waiting
-   between kernels. Safe, bounded, and it applies at every canvas size.
+2. **Close the GPU-utilization gap, at small canvases only** — 74 % occupancy at 8 998 tokens
+   means ~18 % is recoverable by fusing the block's elementwise glue (AdaLN affine, gates,
+   residuals). But occupancy is already 92 % at 24 005 tokens, so the same work buys ~8 % there
+   and less beyond. Safe and bounded, but do not expect it to help the runs that hurt most.
 3. **Sparse attention** — up to ~2× at 768p by this measurement, not 6×, and nothing at small
    canvases (18 % of block compute there). Still the largest single lever at the full canvas,
    but against a substantial implementation cost: the released MSA kernels are CUDA-only, so

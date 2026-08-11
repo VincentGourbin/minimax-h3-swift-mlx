@@ -18,15 +18,17 @@ plus a first (and/or last) keyframe image.
 
 More (including the first 960×544 fox) in [docs/examples/t2va](docs/examples/t2va/README.md).
 
-**Keyframe-conditioned** — a real photograph of a *parked* car, and a prompt telling it to fly.
-It leaves the ground and stays a 2CV: conditioning anchors the scene without freezing it.
+**Keyframe-conditioned** — a real photograph of a *parked* car, a prompt telling it to hover then
+launch, and a detonation asked to land on the departure. It obeys on both counts: the car leaves
+the ground and stays a 2CV for 14.4 s, and the blast peaks at −1.6 dB inside the second its
+timecode named (versus −44 dB during the hover).
 
-| 🚗🕊️ [The flying 2CV — photo in, flight out](docs/examples/fl2va/2cv-fly-576x384.mp4) |
+| 🚗🔥 [The 2CV launch — 14.4 s, sound event on its timecode](docs/examples/fl2va/2cv-launch-576x384-14s.mp4) |
 |---|
-| ![2cv](docs/examples/fl2va/2cv-fly-contact-sheet.png) |
+| ![2cv launch](docs/examples/fl2va/2cv-launch-contact-sheet.png) |
 
-Input image, exact prompt, settings and an honest look at where it breaks down:
-[docs/examples/fl2va](docs/examples/fl2va/README.md).
+Input image, exact prompts, settings, audio envelope and an honest look at where the shorter
+first attempt breaks down: [docs/examples/fl2va](docs/examples/fl2va/README.md).
 
 
 ## Status (August 2026)
