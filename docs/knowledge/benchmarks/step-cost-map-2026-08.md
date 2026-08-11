@@ -42,6 +42,25 @@ checkpoint needed: the shapes decide the cost. Machine not strictly idle — tre
   exactly the sum of its parts (75.8 vs 75.5 s), so there is no allocator or glue overhead
   hiding between the primitives.
 
+## The clean reference (measured after the fact — read this first)
+
+`generate -W 576 -H 384 -f 124 -s 7 --profile` (8 998 tokens, qint8 both components, only light
+background load): **62.9 s/step, σ 4.6 s** over 6 steps (min 55.1, max 69.5).
+
+| | s/step |
+|---|---|
+| clean measurement | **62.9** |
+| this document's bench prediction | 75.8 (overestimates by 21 %) |
+| the figure the map was originally built against | 162 (inflated **2.6×** by contention) |
+
+So the bench slightly *over*states the real cost, and the "gap" analysed below never existed.
+Phase split of that short run: denoising 68 % (GPU 74 %), VAE decode 16 % (GPU 49 %), transformer
+load 7.5 %, peak MLX 34.4 GB.
+
+**New quantified target**: the GPU sits at **74 %** during denoising. The missing quarter is
+launch gaps and unfused elementwise work between kernels — a real, bounded ~18 % that fusing the
+block's glue could recover, without touching the math.
+
 ## The gap that wasn't
 
 At 8 998 tokens the blocks first appeared to explain only 47 % of the measured step (75.8 of
@@ -65,16 +84,19 @@ Optimizing against a number measured under contention is how phantom targets get
 
 ## Ranked opportunities
 
-1. **Get one clean reference step** (idle machine, `--profile`). Cheap, and everything below is
-   judged against it. Two of this document's three surprises came from comparing against numbers
-   measured under load.
-2. **Fewer sigma steps** — zero code risk, saving exactly linear in steps: 30 → 20 is −33 % of a
-   run. Needs only a same-seed quality comparison, which the CLI can already produce.
+1. **Fewer sigma steps** — zero code risk, saving exactly linear in steps: 30 → 20 is −33 % of a
+   run. Needs only a same-seed quality comparison, which the CLI can already produce. Nothing
+   below is this cheap.
+2. **Close the GPU-utilization gap** — 74 % during denoising means ~18 % is recoverable by
+   fusing the block's elementwise glue (AdaLN affine, gates, residuals) so the GPU stops waiting
+   between kernels. Safe, bounded, and it applies at every canvas size.
 3. **Sparse attention** — up to ~2× at 768p by this measurement, not 6×, and nothing at small
    canvases (18 % of block compute there). Still the largest single lever at the full canvas,
    but against a substantial implementation cost: the released MSA kernels are CUDA-only, so
    only the algorithm transfers.
-4. **Fuse the elementwise glue** — at 39 930 tokens the composed block costs 16 % more than the
-   sum of its primitives; part of that is fusable. Modest and safe, worth it only after 1-3.
-5. **Nothing else in the block is worth touching**: rotary, AdaLN gathers and RMSNorm are ~1 %,
-   transposed views into SDPA cost nothing, weight traffic costs nothing.
+4. **Nothing else in the block is worth touching**: rotary, AdaLN gathers and RMSNorm are ~1 %,
+   transposed views into SDPA cost nothing, weight traffic costs nothing (all measured above).
+
+**And a standing rule, learned the hard way here**: measure the reference on an otherwise idle
+machine before optimizing against it. The first version of this document chased an 85 s phantom
+that was pure contention in the reference figure.
