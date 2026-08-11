@@ -135,3 +135,22 @@ Optimizing against a number measured under contention is how phantom targets get
 **And a standing rule, learned the hard way here**: measure the reference on an otherwise idle
 machine before optimizing against it. The first version of this document chased an 85 s phantom
 that was pure contention in the reference figure.
+
+## Sigma-step study (2026-08-11, same seed, 576×384/124f)
+
+Three runs, seed 0, identical prompt, 30 / 20 / 15 grid points. Changing the grid changes every
+σ value, so the trajectories diverge from step 1 (PSNR 30-vs-20 ≈ 17 dB — divergence, not
+quality, exactly like the quantization comparison). The judgment is therefore "equally clean?",
+frame by frame:
+
+- **Video: no visible degradation at any of the three.** The fox, fur detail and background
+  stay crisp at 15 points. Wall times under identical conditions: 48 / 32 / 25 min.
+- **Audio: a flag at 15.** Peak level holds from 30 to 20 points (−35.0 → −34.6 dB) then drops
+  10 dB at 15 (−45.3 dB). Could be legitimate trajectory divergence (a quieter scene), but the
+  30→20 stability against the 20→15 drop makes fewer-steps audio degradation the more likely
+  reading. The audio scheduler's shift-3 grid loses proportionally more of its low-σ tail than
+  the video's shift-12 grid does.
+
+**Recommendation: 20 sigma points as the practical default** — a third off every run against
+the 30 the quality runs used (and 60 % off the CLI's old default of 50), with video and audio
+both holding. Treat 15 as a video-only fast mode until its audio is listened to.
