@@ -78,6 +78,23 @@ Two things follow, and both correct what is written above:
    the discrepancy is understood — attention's real share at large sizes is probably higher than
    the bench's 49 %.
 
+## MLX.compile on the production blocks: bit-exact, roughly neutral
+
+Tried (opt-in `generate --compile-blocks`, kept in the tree): each block's forward wrapped in
+`MLX.compile`, weights captured as constants. The parity harness shows the compiled path is
+**bit-exact** against eager (max|Δ| = 0.0 on both heads), and `temb`'s row count changing between
+step 1 (both schedulers at σ=1 collapse to one distinct timestep) and step 2 forces one
+recompilation — after that the signature is stable.
+
+Measured back to back on the same (contended) machine at 8 998 tokens: compiled 109.5 s/step
+average vs eager control 114.0, steady-state minima 74 vs 80 — a gain somewhere in the 0–8 %
+band, unresolvable under that night's noise, with GPU occupancy unchanged (72 % vs 73 %). The
+bench's isolated-block +14 % does not materialize in production: the fused elementwise glue is a
+small slice of a step that also contains sequence assembly, output heads and the scheduler.
+
+Verdict: keep the flag available, default off; re-measure the pair on a strictly idle machine
+before ever claiming a number. Not a lever worth pursuing further at current sizes.
+
 ## The gap that wasn't
 
 At 8 998 tokens the blocks first appeared to explain only 47 % of the measured step (75.8 of

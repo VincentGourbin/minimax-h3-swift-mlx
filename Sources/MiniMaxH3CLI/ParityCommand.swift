@@ -320,6 +320,18 @@ struct ParityCommand: AsyncParsableCommand {
             try compare(ours: video, reference: reference["video_out"]![0], name: "video velocity")
             try compare(ours: audio, reference: reference["audio_out"]![0], name: "audio velocity")
 
+            // The graph-compiled block must produce the same numbers as the eager one — fusion
+            // may reassociate float ops, so identical-to-eager is checked at bf16 noise level.
+            transformer.compileBlocks = true
+            let (videoCompiled, audioCompiled) = transformer(
+                videoRows: reference["video_rows"]![0],
+                audioRows: reference["audio_rows"]![0],
+                textEmbeds: reference["text_embeds"]!.asType(.bfloat16),
+                timesteps: timesteps, timestepIndices: timestepIndices, layout: layout
+            )
+            try compare(ours: videoCompiled, reference: video, name: "video velocity (compiled vs eager)")
+            try compare(ours: audioCompiled, reference: audio, name: "audio velocity (compiled vs eager)")
+
         default:
             throw ValidationError("Unknown component '\(component)'.")
         }

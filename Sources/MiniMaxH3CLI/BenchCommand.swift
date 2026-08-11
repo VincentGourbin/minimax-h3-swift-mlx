@@ -147,6 +147,32 @@ struct BenchCommand: AsyncParsableCommand {
             blockRows.append((name, Date().timeIntervalSince(start) / Double(reps), blocks))
             Memory.clearCache()
         }
+        // The same block, wrapped in MLX's graph compiler: fuses the elementwise glue (AdaLN
+        // affines, gates, residuals, SwiGLU pointwise) into fewer kernels without touching the
+        // math. If this closes the GPU-occupancy gap, opportunity #2 costs one `compile` call.
+        func composedBlock(_ input: MLXArray) -> MLXArray {
+            let modulation = modulationTable.map { $0.take(indices, axis: 0) }
+            var h = input
+            let attnInput = norm(h) * (1.0 + modulation[1]) + modulation[0]
+            var q = qkv[0](attnInput).reshaped(1, tokens, heads, headDim)
+            var k = qkv[1](attnInput).reshaped(1, tokens, heads, headDim)
+            let v = qkv[2](attnInput).reshaped(1, tokens, heads, headDim)
+            q = applyH3RotaryEmb(q, cos: cosTable, sin: sinTable)
+            k = applyH3RotaryEmb(k, cos: cosTable, sin: sinTable)
+            let attended = MLXFast.scaledDotProductAttention(
+                queries: q.transposed(0, 2, 1, 3), keys: k.transposed(0, 2, 1, 3),
+                values: v.transposed(0, 2, 1, 3),
+                scale: 1.0 / Float(headDim).squareRoot(), mask: nil)
+            h = h + modulation[2]
+                * outProj(attended.transposed(0, 2, 1, 3).reshaped(1, tokens, heads * headDim))
+            let ffInput = norm(h) * (1.0 + modulation[4]) + modulation[3]
+            let gated = ffProj(ffInput)
+            let halves = gated.split(parts: 2, axis: -1)
+            return h + modulation[5] * ffOut(halves[0] * sigmoid(halves[1]))
+        }
+        let compiledBlock = MLX.compile(composedBlock)
+        measureBlock("FULL BLOCK (MLX.compile)") { compiledBlock(x) }
+
         measureBlock("FULL BLOCK (composed)") {
             let modulation = modulationTable.map { $0.take(indices, axis: 0) }
             var h = x
@@ -246,15 +272,16 @@ struct BenchCommand: AsyncParsableCommand {
         }
         print(String(format: "\n%-26@ %31.1f s  (sum of primitives, best case)",
                      "primitives total" as NSString, total))
-        if let block = blockRows.first {
-            let composed = block.perCall * Double(block.callsPerStep)
-            print(String(format: "%-26@ %31.1f s  (%.2f s/block x %d)",
-                         "composed blocks" as NSString, composed, block.perCall, block.callsPerStep))
-            print(String(format: "%-26@ %31.1f s  (%.0f%% on top of the primitives)",
-                         "composition overhead" as NSString, composed - total,
-                         100 * (composed - total) / total))
-            print(String(format: "%-26@ %31.1f s  (%.0f%% of the measured step)",
-                         "predicted step" as NSString, composed, 100 * composed / stepSeconds))
+        for block in blockRows {
+            let perStep = block.perCall * Double(block.callsPerStep)
+            print(String(format: "%-26@ %31.1f s  (%.2f s/block x %d — %.0f%% of the measured step)",
+                         block.name as NSString, perStep, block.perCall, block.callsPerStep,
+                         100 * perStep / stepSeconds))
+        }
+        if blockRows.count == 2 {
+            let a = blockRows[0].perCall, b = blockRows[1].perCall
+            print(String(format: "%-26@ %30.1f%%  (compile vs eager)",
+                         "fusion gain" as NSString, 100 * (b - a) / b))
         }
     }
 }

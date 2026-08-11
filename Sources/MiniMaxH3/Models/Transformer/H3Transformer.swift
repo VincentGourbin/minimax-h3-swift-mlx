@@ -333,8 +333,33 @@ final class H3TransformerBlock: Module {
         )
     }
 
+    /// Graph-compiled forward, built lazily on first use. Fuses the elementwise glue (AdaLN
+    /// affines, gates, residuals, SwiGLU pointwise) into fewer kernels; the math is unchanged
+    /// and the weights are captured as constants. Compilation happens once per input signature
+    /// — the first denoising step absorbs it, like the existing kernel-compile spike.
+    private var compiledForward: (@Sendable ([MLXArray]) -> [MLXArray])?
+
     /// adalnIndices = timestepIndices * 3 + tokenTags, (seq,) int32.
     func callAsFunction(
+        _ x: MLXArray,
+        temb: MLXArray,
+        adalnIndices: MLXArray,
+        rotary: (cos: MLXArray, sin: MLXArray),
+        compiled: Bool = false
+    ) -> MLXArray {
+        guard compiled else {
+            return forward(x, temb: temb, adalnIndices: adalnIndices, rotary: rotary)
+        }
+        if compiledForward == nil {
+            compiledForward = MLX.compile { [unowned self] arrays in
+                [forward(arrays[0], temb: arrays[1], adalnIndices: arrays[2],
+                         rotary: (arrays[3], arrays[4]))]
+            }
+        }
+        return compiledForward!([x, temb, adalnIndices, rotary.cos, rotary.sin])[0]
+    }
+
+    private func forward(
         _ x: MLXArray,
         temb: MLXArray,
         adalnIndices: MLXArray,
@@ -376,6 +401,12 @@ public final class H3Transformer: Module {
     @ModuleInfo(key: "norm_out") var normOut: H3AdaLNOut
     @ModuleInfo(key: "proj_out") var projOut: Linear
     @ModuleInfo(key: "audio_proj_out") var audioProjOut: Linear
+
+    /// Compile each block's forward into a fused graph (`MLX.compile`). Same math, fewer
+    /// kernels — recovers the GPU idle share between elementwise ops, which the cost map
+    /// measured at ~26 % of denoising at 9k tokens and ~8 % at 24k. Off by default until a
+    /// generation has validated it on the caller's side; the parity harness covers numerics.
+    public var compileBlocks = false
 
     public init(config: H3TransformerConfig) {
         self.config = config
@@ -442,7 +473,8 @@ public final class H3Transformer: Module {
         let adalnIndices = timestepIndices * Int32(H3AdaLNModulation.modalityCount) + layout.tokenTags
 
         for block in blocks {
-            x = block(x, temb: temb, adalnIndices: adalnIndices, rotary: rotary)
+            x = block(x, temb: temb, adalnIndices: adalnIndices, rotary: rotary,
+                      compiled: compileBlocks)
         }
 
         // 5. Output norm (indexed per row by timestep), then both float32 heads over every row;

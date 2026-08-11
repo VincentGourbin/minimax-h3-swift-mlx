@@ -68,6 +68,9 @@ struct GenerateCommand: AsyncParsableCommand {
     @Flag(name: .long, help: "Rewrite the prompt into Context-IR format with local Gemma 4 first.")
     var enhancePrompt = false
 
+    @Flag(name: .long, help: "Graph-compile the transformer blocks (fused kernels, same math).")
+    var compileBlocks = false
+
     @Flag(name: .long, help: "Verbose debug logging.")
     var debug = false
 
@@ -156,6 +159,7 @@ struct GenerateCommand: AsyncParsableCommand {
         }
         request.transformerQuantization = transformerQuantization
         request.textEncoderQuantization = textEncoderQuantization
+        request.compileBlocks = compileBlocks
 
         let pipeline = H3Pipeline(modelDirectory: URL(fileURLWithPath: modelsDir))
         pipeline.progressHandler = { phase, step, total in

@@ -37,6 +37,8 @@ public struct H3GenerationRequest: Sendable {
     public var transformerQuantization: H3Quantization = .none
     /// On-the-fly quantization of the Qwen3-VL conditioner.
     public var textEncoderQuantization: H3Quantization = .none
+    /// Graph-compile each transformer block (`MLX.compile`): same math, fused elementwise glue.
+    public var compileBlocks = false
 
     public init(prompt: String) { self.prompt = prompt }
 }
@@ -285,6 +287,7 @@ public final class H3Pipeline {
         profiler.start("Load Transformer")
         var transformer: H3Transformer? = try H3WeightLoader.loadTransformer(
             modelDirectory: modelDirectory, quantization: request.transformerQuantization)
+        transformer!.compileBlocks = request.compileBlocks
         Memory.clearCache()
         profiler.end("Load Transformer")
 
