@@ -89,15 +89,10 @@ public final class H3AttentionAudit: @unchecked Sendable {
             .reshaped(sampleRows, blockSize, heads, -1)
             .mean(axis: 1)  // (S, heads, D)
 
-        // The vote indexer needs every row of each sampled query block, not just the sampled row.
-        let qFullBlocks = q[0].take(MLXArray(blockRowIndices), axis: 0)
-            .reshaped(sampleRows, blockSize, heads, -1)  // (S, 64, heads, D)
-
         // Collect per-head tensors so the head-shared ranking can be evaluated afterwards.
         var massChunks = [MLXArray]()      // (H, S, numBlocks) each
         var proxyChunks = [MLXArray]()     // MSA proxy: block-max of true scores
         var pooledChunks = [MLXArray]()    // practical indexer: block-mean q, block-max of scores
-        var votedChunks = [MLXArray]()     // vote indexer: per-row ranking vs pooled keys, block votes
 
         for headStart in stride(from: 0, to: heads, by: headChunk) {
             let headEnd = min(heads, headStart + headChunk)
@@ -125,34 +120,12 @@ public final class H3AttentionAudit: @unchecked Sendable {
             let pooledScores = matmul(qmc, kc) * scale
             pooledChunks.append(blockView(pooledScores, padValue: -.infinity).max(axis: -1))
 
-            // Vote indexer: every row of the query block scores the key BLOCKS (keys mean-pooled
-            // per block — 1/64th of the full-score cost in production), takes its own top-30 %,
-            // and the block's selection is the vote count, ties broken by the mean score.
-            let kMean = kc.reshaped(kc.dim(0), kc.dim(1), -1)  // (H, D, seq) -> pool below
-            let kPadded = padColumns > 0
-                ? concatenated([kMean, MLXArray.zeros([kc.dim(0), kc.dim(1), padColumns])], axis: -1)
-                : kMean
-            let kBlockMean = kPadded.reshaped(kc.dim(0), kc.dim(1), numBlocks, blockSize)
-                .mean(axis: -1)  // (H, D, numBlocks)
-            let qRows = qFullBlocks[0..., 0..., headStart..<headEnd]
-                .transposed(2, 0, 1, 3).asType(.float32)  // (H, S, 64, D)
-            let rowScores = matmul(
-                qRows.reshaped(qRows.dim(0), -1, qRows.dim(3)), kBlockMean
-            ).reshaped(qRows.dim(0), sampleRows, blockSize, numBlocks)  // (H, S, 64, nB)
-            let voteCount = max(1, Int((Double(numBlocks) * 0.3).rounded()))
-            let sortedRow = takeAlong(
-                rowScores, argSort(rowScores, axis: -1)[.ellipsis, .stride(by: -1)], axis: -1)
-            let threshold = sortedRow[.ellipsis, (voteCount - 1)...(voteCount - 1)]
-            let votes = (rowScores .>= threshold).asType(.float32).sum(axis: 2)  // (H, S, nB)
-            let meanScore = rowScores.mean(axis: 2)
-            votedChunks.append(votes * 1000.0 + meanScore)  // rank key: votes first, score ties
-            eval(massChunks.last!, proxyChunks.last!, pooledChunks.last!, votedChunks.last!)
+            eval(massChunks.last!, proxyChunks.last!, pooledChunks.last!)
         }
 
         let mass = concatenated(massChunks, axis: 0)      // (heads, S, numBlocks)
         let proxy = concatenated(proxyChunks, axis: 0)
         let pooled = concatenated(pooledChunks, axis: 0)
-        let voted = concatenated(votedChunks, axis: 0)
 
         func meanCurve(orderedBy ranking: MLXArray) -> MLXArray {
             // ranking broadcasts over heads when it is (1, S, numBlocks).
@@ -162,26 +135,35 @@ public final class H3AttentionAudit: @unchecked Sendable {
             let orderedMass = takeAlong(mass, expanded, axis: -1)
             return cumsum(orderedMass.reshaped(-1, numBlocks).mean(axis: 0), axis: 0)
         }
+        // Head groups: adjacent heads share one selection, ranked by the group-mean of the
+        // pooled proxy but judged against every member head's true mass. Group size trades
+        // gather-row width (the production bottleneck) against selection fidelity.
+        func groupRanking(_ groupSize: Int) -> MLXArray {
+            let groups = heads / groupSize
+            return broadcast(
+                pooled.reshaped(groups, groupSize, sampleRows, numBlocks)
+                    .mean(axis: 1).expandedDimensions(axis: 1),
+                to: [groups, groupSize, sampleRows, numBlocks]
+            ).reshaped(heads, sampleRows, numBlocks)
+        }
         let oracleCurve = meanCurve(orderedBy: mass)
-        let proxyCurve = meanCurve(orderedBy: proxy)
         let pooledCurve = meanCurve(orderedBy: pooled)
-        let votedCurve = meanCurve(orderedBy: voted)
-        // Head-shared: one selection for all 56 heads (single gather in a real kernel), ranked
-        // by the head-mean of the pooled proxy.
+        let group4Curve = meanCurve(orderedBy: groupRanking(4))
+        let group8Curve = meanCurve(orderedBy: groupRanking(8))
         let sharedCurve = meanCurve(orderedBy: pooled.mean(axis: 0).expandedDimensions(axis: 0))
-        eval(oracleCurve, proxyCurve, pooledCurve, votedCurve, sharedCurve)
+        eval(oracleCurve, pooledCurve, group4Curve, group8Curve, sharedCurve)
 
         var report = "[attention audit] layer \(layer) — \(seq) tokens, \(numBlocks) blocks of \(blockSize)\n"
-        report += "  blocks kept   oracle    proxy(MSA)  pooled-q   voted     head-shared\n"
+        report += "  blocks kept   oracle    pooled/head  grp-4     grp-8     shared-56\n"
         for fraction in [0.05, 0.10, 0.20, 0.30, 0.50] {
             let kept = max(1, Int((Double(numBlocks) * fraction).rounded()))
             report += String(
-                format: "  %4d (%3.0f%%)  %8.4f  %8.4f   %8.4f  %8.4f   %8.4f\n",
+                format: "  %4d (%3.0f%%)  %8.4f   %8.4f  %8.4f  %8.4f   %8.4f\n",
                 kept, fraction * 100,
                 oracleCurve[kept - 1].item(Float.self),
-                proxyCurve[kept - 1].item(Float.self),
                 pooledCurve[kept - 1].item(Float.self),
-                votedCurve[kept - 1].item(Float.self),
+                group4Curve[kept - 1].item(Float.self),
+                group8Curve[kept - 1].item(Float.self),
                 sharedCurve[kept - 1].item(Float.self))
         }
         print(report)

@@ -218,3 +218,18 @@ per-head and the collapsed head-shared curve — measure before building); (2) i
 this optimization needs a fused Metal kernel — which is MSA's own answer — and moves from
 "pure-MLX afternoon" to "kernel project". The implementation stays in the tree
 (`--sparse-attention`, off by default) as the substrate for either.
+
+## Head-group selection (2026-08-12) — the pure-MLX sparse path is exhausted
+
+Last cheap card, measured: adjacent-head groups sharing one selection (fattening gather rows
+4-8×, the production bottleneck). At 30 % blocks kept, groups of 4 lose 9-12 points of captured
+mass on the layers where per-head selection mattered (layer 12: 86 → 74 %; layer 49: 90 → 81 %),
+landing much closer to the collapsed shared-56 curve than to per-head. H3's heads genuinely
+attend to different places; no sharing granularity reconciles gather efficiency with selection
+fidelity. (Layer 37 is the lone exception — its heads agree, every mode ties at ~80 %.)
+
+**Investigation closed.** Block-sparse attention on this checkpoint needs per-head selection,
+and per-head selection at speed needs a fused kernel that never materializes the gather —
+which is exactly what MSA's CUDA release is. The complete substrate stays in the tree
+(`--sparse-attention`, indexer, audit tooling) for a future Metal-kernel project or a usable
+upstream release (action plan 405 watches). Until then, the standing win is `-s 20` (−33 %).
