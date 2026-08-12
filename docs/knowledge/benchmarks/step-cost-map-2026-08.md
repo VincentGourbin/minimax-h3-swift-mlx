@@ -162,3 +162,36 @@ at 50 deliberately**: it is the released pipeline's default and the baseline eve
 in this repo is built against; changing it would silently pollute future baselines. Pass
 `-s 20` explicitly for practical runs — a third off the 30-step quality runs, 60 % off the
 default.
+
+## Attention-mass audit (2026-08-12) — the sparse premise, measured
+
+`H3_ATTN_AUDIT=3 generate …` (24 005-token request, 23 200 media rows audited, denoising step 3,
+512 sampled query rows × all 56 heads, blocks of 64). Two curves per layer: mass captured by the
+top-k blocks ranked by true mass (oracle) versus ranked by **MSA's parameter-free proxy** (block
+max of raw scores).
+
+| layer | 10 % of blocks | 20 % | 30 % | 50 % |
+|---|---|---|---|---|
+| 0 | 0.53 / 0.52 | 0.68 / 0.67 | 0.77 / 0.76 | 0.88 / 0.88 |
+| 12 | 0.82 / 0.80 | 0.90 / 0.90 | 0.94 / 0.94 | 0.98 / 0.98 |
+| 25 | 0.83 / 0.81 | 0.92 / 0.91 | 0.95 / 0.95 | 0.99 / 0.98 |
+| 37 | 0.78 / 0.76 | 0.87 / 0.86 | 0.92 / 0.91 | 0.97 / 0.96 |
+| 49 | 0.83 / 0.83 | 0.90 / 0.89 | 0.93 / 0.93 | 0.97 / 0.97 |
+
+(each cell: oracle / proxy)
+
+Three conclusions:
+
+1. **The mass is concentrated where it matters.** From layer 12 on, 30 % of the blocks carry
+   92-95 % of the attention mass. Layer 0 is the exception — diffuse (77 % at 30 % kept) — so a
+   port should keep the first layer(s) dense, which sparse recipes do anyway.
+2. **MSA's selection rule works without any learned weights**: the proxy sits within 1-2 points
+   of the oracle everywhere. Nothing is missing from the checkpoint to reproduce the selection.
+3. **The expected gain is real but bounded**: attention at ~50 % of block compute × keeping 30 %
+   of blocks ≈ **–35 % of a step at the full canvas**, more if attention's true share at 40k
+   tokens exceeds the bench's 49 % (the tokens^1.9 scaling suggests it does). Consistent with
+   the ~2× ceiling, not the 6× the plan once assumed.
+
+Caveat: captured mass is a proxy for fidelity, not a guarantee — the discarded 5-8 % could still
+matter perceptually. The decision point (build or drop) is passed; the next checkpoint is a
+same-seed comparison with a block-sparse prototype.

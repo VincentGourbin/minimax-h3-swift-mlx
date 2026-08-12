@@ -152,6 +152,10 @@ final class H3Attention: Module {
             q = applyH3RotaryEmb(q, cos: rotary.cos, sin: rotary.sin)
             k = applyH3RotaryEmb(k, cos: rotary.cos, sin: rotary.sin)
         }
+        if H3AttentionAudit.shared.enabled, rotary != nil {
+            H3AttentionAudit.shared.maybeAudit(
+                q: q, k: k, scale: 1.0 / Float(headDim).squareRoot())
+        }
 
         let out = MLXFast.scaledDotProductAttention(
             queries: q.transposed(0, 2, 1, 3),
@@ -472,7 +476,9 @@ public final class H3Transformer: Module {
         // 4. Row -> AdaLN table row.
         let adalnIndices = timestepIndices * Int32(H3AdaLNModulation.modalityCount) + layout.tokenTags
 
-        for block in blocks {
+        if H3AttentionAudit.shared.enabled { H3AttentionAudit.shared.beginForward() }
+        for (index, block) in blocks.enumerated() {
+            if H3AttentionAudit.shared.enabled { H3AttentionAudit.shared.currentLayer = index }
             x = block(x, temb: temb, adalnIndices: adalnIndices, rotary: rotary,
                       compiled: compileBlocks)
         }
