@@ -156,6 +156,9 @@ frame by frame:
   comparison is necessary but NOT sufficient: motion smoothness must be judged on the playing
   video. Together with the 10 dB audio drop, 15 points is rejected outright.
 
-**Recommendation: 20 sigma points as the practical default** — a third off every run against
-the 30 the quality runs used (and 60 % off the CLI's old default of 50), video, motion and
-audio all holding at the reviewer's eye. 15 is rejected (judder + audio).
+**Final verdict (human-reviewed on the moving videos): 20 sigma points are smooth** — video,
+motion and audio all hold. 15 is rejected (judder + the audio drop). **The CLI default stays
+at 50 deliberately**: it is the released pipeline's default and the baseline every comparison
+in this repo is built against; changing it would silently pollute future baselines. Pass
+`-s 20` explicitly for practical runs — a third off the 30-step quality runs, 60 % off the
+default.

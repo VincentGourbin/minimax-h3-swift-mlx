@@ -154,6 +154,10 @@ minimax-h3 generate "..." --image first.jpg --last-image last.jpg -o morph.mp4
 # regime; smaller trades quality (and ~6 dB of audio level) for speed.
 minimax-h3 generate "..." -W 960 -H 544 -s 30 -o fast.mp4 --profile
 
+# 20 sigma points reviewed smooth (video, motion, audio) at -33 % of a 30-step run; 15 judders.
+# The default stays 50 (the released pipeline's default) — opt in explicitly:
+minimax-h3 generate "..." -s 20 -o quick.mp4
+
 # One-time: export a prequantized text encoder, then every run loads it in seconds
 minimax-h3 export-quantized text-encoder --quant qint8
 minimax-h3 generate "..." --text-encoder-quant qint8 -o out.mp4
