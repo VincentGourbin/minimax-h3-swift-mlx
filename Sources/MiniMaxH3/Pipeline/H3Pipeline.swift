@@ -39,6 +39,8 @@ public struct H3GenerationRequest: Sendable {
     public var textEncoderQuantization: H3Quantization = .none
     /// Graph-compile each transformer block (`MLX.compile`): same math, fused elementwise glue.
     public var compileBlocks = false
+    /// Block-sparse attention keep fraction (nil = full attention). Approximation, opt-in.
+    public var sparseAttentionKeep: Float?
 
     public init(prompt: String) { self.prompt = prompt }
 }
@@ -288,6 +290,7 @@ public final class H3Pipeline {
         var transformer: H3Transformer? = try H3WeightLoader.loadTransformer(
             modelDirectory: modelDirectory, quantization: request.transformerQuantization)
         transformer!.compileBlocks = request.compileBlocks
+        transformer!.sparseAttentionKeep = request.sparseAttentionKeep
         Memory.clearCache()
         profiler.end("Load Transformer")
 

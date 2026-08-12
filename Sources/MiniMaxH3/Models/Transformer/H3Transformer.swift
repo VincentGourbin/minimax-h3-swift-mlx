@@ -140,7 +140,12 @@ final class H3Attention: Module {
     }
 
     /// x (B, seq, hidden); rotary optional (token refiner runs without it).
-    func callAsFunction(_ x: MLXArray, rotary: (cos: MLXArray, sin: MLXArray)? = nil) -> MLXArray {
+    /// sparseKeep: fraction of key blocks each query block attends to (nil = full attention).
+    func callAsFunction(
+        _ x: MLXArray,
+        rotary: (cos: MLXArray, sin: MLXArray)? = nil,
+        sparseKeep: Float? = nil
+    ) -> MLXArray {
         let (batch, seq) = (x.dim(0), x.dim(1))
         var q = toQ(x).reshaped(batch, seq, heads, headDim)
         var k = toK(x).reshaped(batch, seq, heads, headDim)
@@ -157,6 +162,11 @@ final class H3Attention: Module {
                 q: q, k: k, scale: 1.0 / Float(headDim).squareRoot())
         }
 
+        // Below ~8k tokens the indexer+gather overhead exceeds what sparsity saves.
+        if let sparseKeep, seq >= 8192 {
+            return toOut(sparseAttention(q: q, k: k, v: v, keep: sparseKeep))
+        }
+
         let out = MLXFast.scaledDotProductAttention(
             queries: q.transposed(0, 2, 1, 3),
             keys: k.transposed(0, 2, 1, 3),
@@ -165,6 +175,88 @@ final class H3Attention: Module {
             mask: nil
         )
         return toOut(out.transposed(0, 2, 1, 3).reshaped(batch, seq, heads * headDim))
+    }
+
+    /// Block-sparse attention, MSA-style with the indexer the attention-mass audit validated:
+    /// block-mean queries against FULL keys, block-max of the scores, top-k per head (the
+    /// key-side max carries the selection quality; head-shared selection collapses — see
+    /// docs/knowledge/benchmarks/step-cost-map-2026-08.md).
+    ///
+    /// Geometry: queries and keys are split into blocks of 64. The tail (seq % 64) is handled
+    /// exactly — tail queries run full attention, and the tail's keys are appended to every
+    /// selection so no query ever loses access to any key. All-gather is one `take` over a
+    /// flattened (heads*seq) view via per-head global offsets.
+    private func sparseAttention(q: MLXArray, k: MLXArray, v: MLXArray, keep: Float) -> MLXArray {
+        let seq = q.dim(1)
+        let scale = 1.0 / Float(headDim).squareRoot()
+        let blockLength = 64
+        let numBlocks = seq / blockLength
+        let mainRows = numBlocks * blockLength
+        let tailRows = seq - mainRows
+        let keptBlocks = max(1, Int((Float(numBlocks) * keep).rounded()))
+        let keptRows = keptBlocks * blockLength
+
+        let q0 = q[0], k0 = k[0], v0 = v[0]  // (seq, heads, D)
+
+        // Indexer: (H, nQ, D) x (H, D, mainRows) -> block-max -> per-head top-k.
+        let qPooled = q0[..<mainRows].reshaped(numBlocks, blockLength, heads, headDim)
+            .mean(axis: 1).transposed(1, 0, 2)
+        let kMainT = k0[..<mainRows].transposed(1, 2, 0)
+        let proxy = matmul(qPooled, kMainT)
+            .reshaped(heads, numBlocks, numBlocks, blockLength).max(axis: -1)
+        let topBlocks = argSort(proxy, axis: -1)[.ellipsis, .stride(by: -1)][
+            0..., 0..., ..<keptBlocks]  // (H, nQ, kB)
+
+        // Block indices -> per-head GLOBAL row indices into the (heads*seq) flattened keys.
+        let rowOffsets = MLXArray((0..<blockLength).map(Int32.init)).reshaped(1, 1, 1, -1)
+        let headOffsets = MLXArray((0..<heads).map { Int32($0 * seq) }).reshaped(-1, 1, 1)
+        let keyRows = (topBlocks.expandedDimensions(axis: -1) * Int32(blockLength) + rowOffsets)
+            .reshaped(heads, numBlocks, keptRows) + headOffsets  // (H, nQ, kB*64)
+
+        let kFlat = k0.transposed(1, 0, 2).reshaped(heads * seq, headDim)
+        let vFlat = v0.transposed(1, 0, 2).reshaped(heads * seq, headDim)
+        let tailK = tailRows > 0
+            ? k0[mainRows...].transposed(1, 0, 2).expandedDimensions(axis: 0) : nil
+        let tailV = tailRows > 0
+            ? v0[mainRows...].transposed(1, 0, 2).expandedDimensions(axis: 0) : nil
+
+        // Chunk query blocks so the K+V gather transient stays ~3 GB.
+        let gatherBytesPerBlock = keptRows * heads * headDim * 2 * 2
+        let chunk = max(4, 3_000_000_000 / gatherBytesPerBlock)
+
+        var pieces = [MLXArray]()
+        for chunkStart in stride(from: 0, to: numBlocks, by: chunk) {
+            let chunkEnd = min(numBlocks, chunkStart + chunk)
+            let count = chunkEnd - chunkStart
+            let rows = keyRows[0..., chunkStart..<chunkEnd].reshaped(-1)
+            // (H*C*kB64, D) -> (C, H, kB64, D)
+            var kSel = kFlat.take(rows, axis: 0)
+                .reshaped(heads, count, keptRows, headDim).transposed(1, 0, 2, 3)
+            var vSel = vFlat.take(rows, axis: 0)
+                .reshaped(heads, count, keptRows, headDim).transposed(1, 0, 2, 3)
+            if let tailK, let tailV {
+                kSel = concatenated([kSel, broadcast(tailK, to: [count, heads, tailRows, headDim])], axis: 2)
+                vSel = concatenated([vSel, broadcast(tailV, to: [count, heads, tailRows, headDim])], axis: 2)
+            }
+            let qChunk = q0[(chunkStart * blockLength)..<(chunkEnd * blockLength)]
+                .reshaped(count, blockLength, heads, headDim).transposed(0, 2, 1, 3)
+            let out = MLXFast.scaledDotProductAttention(
+                queries: qChunk, keys: kSel, values: vSel, scale: scale, mask: nil)
+            // (C, H, 64, D) -> (C*64, H*D)
+            pieces.append(out.transposed(0, 2, 1, 3).reshaped(count * blockLength, heads * headDim))
+        }
+
+        if tailRows > 0 {
+            // Tail queries attend everything — exact, and negligible (< one block).
+            let tailQ = q0[mainRows...].transposed(1, 0, 2).expandedDimensions(axis: 0)
+            let tailOut = MLXFast.scaledDotProductAttention(
+                queries: tailQ,
+                keys: k0.transposed(1, 0, 2).expandedDimensions(axis: 0),
+                values: v0.transposed(1, 0, 2).expandedDimensions(axis: 0),
+                scale: scale, mask: nil)
+            pieces.append(tailOut[0].transposed(1, 0, 2).reshaped(tailRows, heads * headDim))
+        }
+        return concatenated(pieces, axis: 0).expandedDimensions(axis: 0)
     }
 }
 
@@ -349,15 +441,18 @@ final class H3TransformerBlock: Module {
         temb: MLXArray,
         adalnIndices: MLXArray,
         rotary: (cos: MLXArray, sin: MLXArray),
-        compiled: Bool = false
+        compiled: Bool = false,
+        sparseKeep: Float? = nil
     ) -> MLXArray {
         guard compiled else {
-            return forward(x, temb: temb, adalnIndices: adalnIndices, rotary: rotary)
+            return forward(x, temb: temb, adalnIndices: adalnIndices, rotary: rotary,
+                           sparseKeep: sparseKeep)
         }
         if compiledForward == nil {
+            let keep = sparseKeep
             compiledForward = MLX.compile { [unowned self] arrays in
                 [forward(arrays[0], temb: arrays[1], adalnIndices: arrays[2],
-                         rotary: (arrays[3], arrays[4]))]
+                         rotary: (arrays[3], arrays[4]), sparseKeep: keep)]
             }
         }
         return compiledForward!([x, temb, adalnIndices, rotary.cos, rotary.sin])[0]
@@ -367,7 +462,8 @@ final class H3TransformerBlock: Module {
         _ x: MLXArray,
         temb: MLXArray,
         adalnIndices: MLXArray,
-        rotary: (cos: MLXArray, sin: MLXArray)
+        rotary: (cos: MLXArray, sin: MLXArray),
+        sparseKeep: Float? = nil
     ) -> MLXArray {
         let modulation = adalnProj(temb)
         let (shiftMsa, scaleMsa, gateMsa) = (
@@ -383,7 +479,7 @@ final class H3TransformerBlock: Module {
 
         var x = x
         let attnInput = norm1(x) * (1.0 + scaleMsa) + shiftMsa
-        x = x + gateMsa * attn(attnInput, rotary: rotary)
+        x = x + gateMsa * attn(attnInput, rotary: rotary, sparseKeep: sparseKeep)
         let ffInput = norm2(x) * (1.0 + scaleMlp) + shiftMlp
         x = x + gateMlp * ff(ffInput)
         return x
@@ -411,6 +507,15 @@ public final class H3Transformer: Module {
     /// measured at ~26 % of denoising at 9k tokens and ~8 % at 24k. Off by default until a
     /// generation has validated it on the caller's side; the parity harness covers numerics.
     public var compileBlocks = false
+
+    /// Block-sparse attention: fraction of key blocks each query block keeps (nil = full).
+    /// Roughly halves the attention primitive at 24-40k tokens (measured); the audit puts the
+    /// captured attention mass at 80-90 % per layer at keep 0.3 — an approximation, so it is
+    /// opt-in and its quality gate is a same-seed comparison, not parity.
+    public var sparseAttentionKeep: Float?
+    /// Leading layers kept dense under sparse attention: the audit showed layer 0's mass is
+    /// diffuse (77 % captured at 30 % kept versus 92-95 % for the rest of the stack).
+    public var sparseDenseLeadingLayers = 1
 
     public init(config: H3TransformerConfig) {
         self.config = config
@@ -479,8 +584,9 @@ public final class H3Transformer: Module {
         if H3AttentionAudit.shared.enabled { H3AttentionAudit.shared.beginForward() }
         for (index, block) in blocks.enumerated() {
             if H3AttentionAudit.shared.enabled { H3AttentionAudit.shared.currentLayer = index }
+            let keepForLayer = index < sparseDenseLeadingLayers ? nil : sparseAttentionKeep
             x = block(x, temb: temb, adalnIndices: adalnIndices, rotary: rotary,
-                      compiled: compileBlocks)
+                      compiled: compileBlocks, sparseKeep: keepForLayer)
         }
 
         // 5. Output norm (indexed per row by timestep), then both float32 heads over every row;

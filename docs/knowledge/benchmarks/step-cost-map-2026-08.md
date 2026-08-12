@@ -195,3 +195,26 @@ Three conclusions:
 Caveat: captured mass is a proxy for fidelity, not a guarantee — the discarded 5-8 % could still
 matter perceptually. The decision point (build or drop) is passed; the next checkpoint is a
 same-seed comparison with a block-sparse prototype.
+
+## Block-sparse attention, production A/B (2026-08-12): a net loss as implemented
+
+Same-seed pair at 24 005 tokens (576×384×345f, -s 7, qint8): full attention **5 m 55 /step**,
+block-sparse 30 % (audit-validated indexer: pooled-q × full keys, block-max, per-head top-k,
+layer 0 dense, exact tail handling) **9 m 27 /step** — **1.6× slower**, peak memory unchanged
+(34.4 GB both).
+
+The isolated primitive benched 2× *faster*. The gap is gather granularity: the bench used
+head-shared selection (rows of heads×128 = 14 KB per gather), production uses the per-head
+selection the quality audit demands (rows of 128 values = 256 bytes) — 56× more rows, 56×
+smaller, plus per-layer transpose copies the bench prepared off the clock. Without a fused
+kernel, fine-grained gathers dominate.
+
+PSNR between the two runs is 17 dB — trajectory divergence as expected (80-90 % captured mass
+per layer compounds over 49 sparse layers); quality judgment is moot while speed loses.
+
+**Paths forward, in order**: (1) measure head-GROUP selection quality in the audit (groups of
+4-8 heads sharing a selection would fatten gather rows 4-8×; quality sits somewhere between
+per-head and the collapsed head-shared curve — measure before building); (2) if grouping fails,
+this optimization needs a fused Metal kernel — which is MSA's own answer — and moves from
+"pure-MLX afternoon" to "kernel project". The implementation stays in the tree
+(`--sparse-attention`, off by default) as the substrate for either.

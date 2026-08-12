@@ -71,6 +71,9 @@ struct GenerateCommand: AsyncParsableCommand {
     @Flag(name: .long, help: "Graph-compile the transformer blocks (fused kernels, same math).")
     var compileBlocks = false
 
+    @Option(name: .long, help: "Block-sparse attention: fraction of key blocks kept per query block (e.g. 0.3). Approximation — validate against a full-attention run.")
+    var sparseAttention: Double?
+
     @Flag(name: .long, help: "Verbose debug logging.")
     var debug = false
 
@@ -160,6 +163,12 @@ struct GenerateCommand: AsyncParsableCommand {
         request.transformerQuantization = transformerQuantization
         request.textEncoderQuantization = textEncoderQuantization
         request.compileBlocks = compileBlocks
+        if let sparseAttention {
+            guard sparseAttention > 0, sparseAttention < 1 else {
+                throw ValidationError("--sparse-attention must be in (0, 1).")
+            }
+            request.sparseAttentionKeep = Float(sparseAttention)
+        }
 
         let pipeline = H3Pipeline(modelDirectory: URL(fileURLWithPath: modelsDir))
         pipeline.progressHandler = { phase, step, total in

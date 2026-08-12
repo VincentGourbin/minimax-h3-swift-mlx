@@ -36,6 +36,9 @@ struct BenchCommand: AsyncParsableCommand {
     @Option(name: .long, help: "Also run the distinct-weights experiment with N weight sets (0 = skip).")
     var weightSets: Int = 0
 
+    @Option(name: .long, help: "Also time gather-based block-sparse attention keeping this fraction of key blocks (0 = skip).")
+    var sparseKeep: Double = 0
+
     func run() async throws {
         let config = H3TransformerConfig()
         let (hidden, heads, headDim) = (config.hiddenSize, config.numAttentionHeads, config.attentionHeadDim)
@@ -97,6 +100,63 @@ struct BenchCommand: AsyncParsableCommand {
                 values: vSeq.transposed(0, 2, 1, 3),
                 scale: 1.0 / Float(headDim).squareRoot(), mask: nil)
             return out.transposed(0, 2, 1, 3).reshaped(1, tokens, heads * headDim)
+        }
+
+        // 1c. Gather-based block-sparse attention in pure MLX ops: pooled-q indexer -> shared
+        // top-k key blocks per query block -> gather K/V -> batched SDPA over query blocks.
+        // The question this answers: does the gather traffic eat the FLOP savings?
+        if sparseKeep > 0 {
+            let blockLength = 64
+            let queryBlocks = tokens / blockLength           // tail rows ignored, cost-identical
+            let keptBlocks = max(1, Int(Double(queryBlocks) * sparseKeep))
+            let usable = queryBlocks * blockLength
+            let kFlat = kSeq[0][..<usable]                   // (N, heads, D)
+            let vFlat = vSeq[0][..<usable]
+            let qFlat = qSeq[0][..<usable]
+            // Query blocks per gather batch, sized so the K+V gather transient stays ~3 GB —
+            // at 40k tokens a fixed 32 would transit ~11 GB per chunk and thrash the cache.
+            let gatherBytesPerBlock = keptBlocks * blockLength * heads * headDim * 2 * 2
+            let chunk = max(4, Int(3_000_000_000 / gatherBytesPerBlock))
+
+            measure("attention (block-sparse \(Int(sparseKeep * 100))%)", callsPerStep: blocks) {
+                // Indexer: block-mean q x all keys, block-max over keys, head-mean, top-k.
+                let qPooled = qFlat.reshaped(queryBlocks, blockLength, heads, headDim)
+                    .mean(axis: 1).transposed(1, 0, 2)       // (heads, nQ, D)
+                let kT = kFlat.transposed(1, 2, 0)           // (heads, D, N)
+                let pooledScores = matmul(qPooled, kT)       // (heads, nQ, N)
+                let blockProxy = pooledScores
+                    .reshaped(heads, queryBlocks, queryBlocks, blockLength)
+                    .max(axis: -1).mean(axis: 0)             // (nQ, nK) head-shared
+                let topBlocks = argSort(blockProxy, axis: -1)[
+                    .ellipsis, .stride(by: -1)][0..., ..<keptBlocks]  // (nQ, kB)
+                // Block indices -> row indices (nQ, kB*64).
+                let rowOffsets = MLXArray((0..<blockLength).map(Int32.init)).reshaped(1, 1, -1)
+                let keyRows = (topBlocks.expandedDimensions(axis: -1) * Int32(blockLength)
+                    + rowOffsets).reshaped(queryBlocks, keptBlocks * blockLength)
+
+                var pieces = [MLXArray]()
+                for chunkStart in stride(from: 0, to: queryBlocks, by: chunk) {
+                    let chunkEnd = min(queryBlocks, chunkStart + chunk)
+                    let count = chunkEnd - chunkStart
+                    let rows = keyRows[chunkStart..<chunkEnd].reshaped(-1)  // (C*kB64)
+                    // (N, heads, D) -> (C, kB64, heads, D) -> (C, heads, kB64, D)
+                    let kSel = kFlat.take(rows, axis: 0)
+                        .reshaped(count, keptBlocks * blockLength, heads, headDim)
+                        .transposed(0, 2, 1, 3)
+                    let vSel = vFlat.take(rows, axis: 0)
+                        .reshaped(count, keptBlocks * blockLength, heads, headDim)
+                        .transposed(0, 2, 1, 3)
+                    let qChunk = qFlat[(chunkStart * blockLength)..<(chunkEnd * blockLength)]
+                        .reshaped(count, blockLength, heads, headDim)
+                        .transposed(0, 2, 1, 3)              // (C, heads, 64, D)
+                    let out = MLXFast.scaledDotProductAttention(
+                        queries: qChunk, keys: kSel, values: vSel,
+                        scale: 1.0 / Float(headDim).squareRoot(), mask: nil)
+                    pieces.append(out)
+                    eval(out)
+                }
+                return pieces.last!
+            }
         }
 
         // 2. The block's linear algebra — the linear term.
