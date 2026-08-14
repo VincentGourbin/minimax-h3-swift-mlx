@@ -43,7 +43,17 @@ struct BenchDecodeCommand: AsyncParsableCommand {
     @Flag(name: .long, help: "Also time the blocks under MLX.compile.")
     var compileBlocks = false
 
+    @Flag(name: .long, help: "Time the REAL checkpoint's decode instead of the synthetic sweep.")
+    var realVae = false
+
+    @Option(name: .long, help: "Model directory (diffusers layout), for --real-vae.")
+    var modelsDir: String = defaultModelsDirectory()
+
     func run() async throws {
+        if realVae {
+            try runRealVAE()
+            return
+        }
         let config = H3VideoVAEConfig()
         let dim = config.decoderNumAttentionHeads * config.decoderAttentionHeadDim
         let heads = config.decoderNumAttentionHeads
@@ -223,5 +233,152 @@ struct BenchDecodeCommand: AsyncParsableCommand {
             format: "  rotary table rebuild: %.1f ms/pass on the CPU — %.1f s over %d passes, "
                 + "identical every time",
             rotaryCost * 1000, rotaryCost * Double(tiles), tiles))
+
+        // MARK: Everything that is NOT the 36 blocks
+        //
+        // The blocks alone do not account for the measured phase, so time the rest at the real
+        // shapes: the patch projection and its 8-D pixel-shuffle permute, the tile stitching, the
+        // temporal chunk assembly, and the fp32 post-processing the pipeline runs inside the same
+        // phase timer. Shapes below are the 576x384/124f reference run.
+        let chunks = tiles / 6
+        let pixelFrames = latentFrames * config.temporalCompressionRatio          // 28 per pass
+        let tilePx = latentSide * config.spatialCompressionRatio                  // 256
+        let (canvasH, canvasW) = (384, 576)
+        let outFrames = 124
+
+        var stages = [(name: String, seconds: Double, calls: Int)]()
+        func stage(_ name: String, calls: Int, _ body: () -> MLXArray) {
+            eval(body())
+            let start = Date()
+            for _ in 0..<reps { eval(body()) }
+            stages.append((name, Date().timeIntervalSince(start) / Double(reps), calls))
+            Memory.clearCache()
+        }
+
+        let latentTile = MLXRandom.normal([1, config.latentChannels, latentFrames, latentSide, latentSide])
+            .asType(.float16)
+        let projIn = linear(config.latentChannels, dim)
+        let normOut = LayerNorm(dimensions: dim, eps: config.decoderNormEps)
+        let projOut = linear(dim, config.outChannels * config.temporalCompressionRatio
+            * config.spatialCompressionRatio * config.spatialCompressionRatio)
+        let blockOut = MLXRandom.normal([1, tokens, dim]).asType(.float16)
+        eval(latentTile, blockOut, projIn.weight, projOut.weight)
+
+        stage("proj_in + register tokens", calls: tiles) {
+            let x = projIn(latentTile.transposed(0, 2, 3, 4, 1)
+                .reshaped(1, latentFrames * latentSide * latentSide, config.latentChannels))
+            return concatenated([x, MLXArray.zeros([1, 5, dim], dtype: .float16)], axis: 1)
+        }
+        stage("norm_out + proj_out", calls: tiles) {
+            projOut(normOut(blockOut.asType(.float32)).asType(.float16))
+        }
+        let patchTokens = projOut(normOut(blockOut.asType(.float32)).asType(.float16))[
+            0..., ..<(latentFrames * latentSide * latentSide)]
+        eval(patchTokens)
+        stage("pixel-shuffle permute (8-D)", calls: tiles) {
+            let ps = config.spatialCompressionRatio
+            let pt = config.temporalCompressionRatio
+            return patchTokens
+                .reshaped(1, latentFrames, latentSide, latentSide, config.outChannels, pt, ps, ps)
+                .transposed(0, 4, 1, 5, 2, 6, 3, 7)
+                .reshaped(1, config.outChannels, pixelFrames, tilePx, tilePx)
+        }
+
+        let decodedTile = MLXRandom.normal([1, config.outChannels, pixelFrames, tilePx, tilePx])
+            .asType(.float16)
+        eval(decodedTile)
+        func blend(_ a: MLXArray, _ b: MLXArray, extent: Int, axis: Int) -> MLXArray {
+            let axis = axis < 0 ? a.ndim + axis : axis
+            var shape = [Int](repeating: 1, count: a.ndim)
+            shape[axis] = extent
+            let positions = MLXArray(0..<extent).asType(b.dtype).reshaped(shape) / Float(extent)
+            let aTail = a.take(MLXArray((a.dim(axis) - extent)..<a.dim(axis)), axis: axis)
+            let bHead = b.take(MLXArray(0..<extent), axis: axis)
+            let blended = aTail * (1.0 - positions) + bHead * positions
+            let bRest = b.take(MLXArray(extent..<b.dim(axis)), axis: axis)
+            return concatenated([blended, bRest], axis: axis)
+        }
+        stage("tile stitch (2x3 blends + concat)", calls: chunks) {
+            var rows = [MLXArray]()
+            for row in 0..<2 {
+                var tilesInRow = [MLXArray]()
+                for column in 0..<3 {
+                    var tile = decodedTile
+                    if row > 0 { tile = blend(decodedTile, tile, extent: 128, axis: -2) }
+                    if column > 0 { tile = blend(decodedTile, tile, extent: 96, axis: -1) }
+                    if row < 1 { tile = tile[.ellipsis, ..<(tile.dim(-2) - 128), 0...] }
+                    if column < 2 { tile = tile[.ellipsis, ..<(tile.dim(-1) - 96)] }
+                    tilesInRow.append(tile)
+                }
+                rows.append(concatenated(tilesInRow, axis: -1))
+            }
+            return concatenated(rows, axis: -2)
+        }
+
+        let clipPixels = MLXRandom.normal([1, config.outChannels, pixelFrames, canvasH, canvasW])
+            .asType(.float16)
+        eval(clipPixels)
+        stage("temporal blend + chunk concat", calls: 1) {
+            var assembled = [MLXArray]()
+            for index in 0..<chunks {
+                var chunk = clipPixels[0..., 0..., 3..., 0..., 0...]
+                if index > 0 { chunk = blend(clipPixels, chunk, extent: 5, axis: 2) }
+                assembled.append(chunk)
+            }
+            return concatenated(assembled, axis: 2)
+        }
+
+        let decoded = MLXRandom.normal([1, config.outChannels, outFrames, canvasH, canvasW])
+            .asType(.float16)
+        eval(decoded)
+        stage("post-processing (fp32 denorm, permute, uint8)", calls: 1) {
+            let mean = MLXArray(H3Constants.pixelMean).reshaped(1, -1, 1, 1, 1)
+            let std = MLXArray(H3Constants.pixelStd).reshaped(1, -1, 1, 1, 1)
+            let video = clip(decoded.asType(.float32) * std + mean, min: 0.0, max: 1.0)
+            return (video[0].transposed(1, 2, 3, 0) * 255.0).round().asType(.uint8)
+        }
+
+        print("\n  Everything around the 36 blocks, at the 576x384/124f shapes:")
+        print("  ──────────────────────────────────────────────────────────────")
+        var outside = 0.0
+        for entry in stages {
+            let total = entry.seconds * Double(entry.calls)
+            outside += total
+            let label = entry.name.padding(toLength: 42, withPad: " ", startingAt: 0)
+            print(String(format: "  %@ %7.3f s x%4d = %6.2f s",
+                         label, entry.seconds, entry.calls, total))
+        }
+        let blocksTotal = (baseline ?? 0) * Double(tiles)
+        print(String(format: "  %@ %22.2f s",
+                     "36 blocks".padding(toLength: 42, withPad: " ", startingAt: 0), blocksTotal))
+        print(String(format: "  %@ %22.2f s  (measured phase: %.1f s)",
+                     "TOTAL".padding(toLength: 42, withPad: " ", startingAt: 0),
+                     blocksTotal + outside, phaseSeconds))
+    }
+
+    /// The synthetic sweep models the 36 blocks and everything around them; if it does not add up
+    /// to the phase the profiler measured, the difference is in the checkpoint path itself. Two
+    /// decodes back to back separate first-touch cost (lazy safetensors paging off the SSD, Metal
+    /// kernel specialization) from the steady state that a longer run would actually pay.
+    private func runRealVAE() throws {
+        print("Loading the video VAE from \(modelsDir) …")
+        let loadStart = Date()
+        let vae = try H3WeightLoader.loadVideoVAE(modelDirectory: URL(fileURLWithPath: modelsDir))
+        eval(vae.parameters())
+        print(String(format: "  loaded and resident in %.1f s", Date().timeIntervalSince(loadStart)))
+
+        // Reference run geometry: 576x384 / 124 frames -> 37 latent frames, 24x36 latent canvas.
+        let latents = MLXRandom.normal([1, 24, 37, 24, 36]).asType(.float32)
+        eval(latents)
+        for pass in 1...max(2, reps) {
+            let start = Date()
+            let decoded = vae.decode(latents)
+            eval(decoded)
+            let seconds = Date().timeIntervalSince(start)
+            print(String(format: "  decode %d: %.1f s  (%.2f s per tile pass, %.2f TFLOP/s)",
+                         pass, seconds, seconds / Double(tiles),
+                         Double(tiles) * 9.64e12 / 1e12 / seconds))
+            Memory.clearCache()
+        }
     }
 }

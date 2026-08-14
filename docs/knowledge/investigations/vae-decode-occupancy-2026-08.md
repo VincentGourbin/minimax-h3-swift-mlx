@@ -2,17 +2,18 @@
 okf_version: "0.1"
 kind: investigation
 created: 2026-08-13
-status: static analysis done, measurements pending an idle GPU
+updated: 2026-08-14
+status: closed — every hypothesis refuted, the decode is GPU-saturated
 device: Apple M3 Max, 96 GB unified memory
 ---
 
-# The video VAE decode leaves the GPU half idle — what the shapes already say
+# The video VAE decode does NOT leave the GPU half idle
 
 Issue #4. Every profiled run reports the same pair of numbers for the decode phase: **GPU 49 %,
 CPU 3.4 %**, against **GPU 74 %, CPU 1.4 %** for denoising on the same run. This note is the
-static half of the investigation: what can be established from the geometry and the arithmetic
-without occupying the GPU, so that the measurements — when the machine is free — are three
-targeted questions instead of a fishing trip.
+investigation of that pair. The first half below is what the geometry and the arithmetic said
+before any GPU was occupied; the results section at the end is what the measurements said, and
+they refute the premise — including the 49 % itself, which reads 99–100 % when sampled directly.
 
 ## The decode workload is N copies of one shape
 
@@ -99,3 +100,61 @@ these shapes and issue #4 closes as "no headroom without a fused kernel", like t
 
 Standing method note: idle machine, control sample back to back — that discipline has already
 reversed two conclusions in this repo.
+
+---
+
+# Results (2026-08-14) — every hypothesis refuted
+
+Measured with `minimax-h3 bench-decode`, cold machine, 5-minute cooldown before each point (see
+the protocol caveat below — without it these numbers are worthless).
+
+## Batching the passes: refuted, it makes things worse
+
+| batch | s/call | s/pass | TFLOP/s | vs batch 1 |
+|---|---|---|---|---|
+| 1 | 1.143 | 1.143 | 8.43 | 1.00× |
+| 2 | 2.244 | 1.122 | 8.59 | 1.02× |
+| 3 | 3.621 | 1.207 | 7.99 | 0.95× |
+| 6 | 8.335 | 1.389 | 6.94 | **0.82×** |
+
+A 1797-token GEMM already saturates the machine; fusing passes only adds memory traffic. The
+whole premise of hypothesis 1 — "the GEMMs are too small" — is wrong.
+
+## The rest of the suspects
+
+- **Per-pass `eval()` barrier**: −0.4 %, +2.8 %, −19.9 % across runs — i.e. noise, no signal.
+- **Rotary table rebuilt per pass**: 0.1 ms, so 4 ms over a whole decode. Hygiene at most.
+- **`MLX.compile` on the blocks** (A/B/B/A, cooldown before each point): compiled 1.116 / 1.135 s
+  vs eager 1.138 / 1.164 s → −2.2 % against a ±2 % intra-variant spread. Neutral, same verdict as
+  the transformer campaign.
+- **Everything outside the 36 blocks**, timed at the real shapes: proj_in 0.04 s, norm_out +
+  proj_out 0.14 s, the 8-D pixel-shuffle permute 0.01 s, tile stitching 0.04 s, temporal blends
+  0.01 s, fp32 post-processing 0.02 s — **0.26 s out of 87**, 0.3 % of the phase.
+- **The 49 % itself**: sampling `Device Utilization %` once a second during a real checkpoint
+  decode gives **99–100 %** throughout. The profiler's phase average is not measuring headroom.
+
+## Why the bench said 48 s and production says 87 s
+
+Not missing work — the GPU's clock state. The same binary, same shapes, same machine, run at
+different moments: **1.14 → 11.1 → 2.25 → 1.70 s/pass**. After five idle minutes it came back to
+**1.139**, three thousandths from the very first measurement. A short burst on a cold GPU sustains
+8.4 TFLOP/s; an 80-second phase — which is by definition sustained load — runs around 5. The
+87.2 s the profiler reports for the decode phase is the sustained truth; the bench's 48 s is the
+burst rate, and no amount of orchestration reaches it.
+
+Consequence for every future bench in this repo: see
+[gpu-burst-vs-sustained](../pitfalls/gpu-burst-vs-sustained.md).
+
+## Verdict
+
+The video VAE decode is **GPU-saturated and running at the machine's sustained rate**. There is no
+orchestration headroom: not in batching, not in the barrier, not in kernel fusion, not in the glue.
+Issue #4 closes the way #2 did — the premise was an artifact of the metric.
+
+The only lever left is arithmetic, not orchestration: **the 256 px tiling decodes 1.78× more pixels
+than the canvas has** at 576×384 (6 tiles × 256² = 393 k px for a 221 k px frame). Decoding a chunk
+untiled would cut the linear work 44 % while raising attention (6048 tokens vs 6 × 1797) — net
+**−31 % of the decode work** at this canvas. But it inverts at 768p, where an untiled chunk is
+28 224 tokens and attention explodes (235 TFLOP against 90 for the tiled path), and it changes the
+output, since the released frames are the blended-tile ones and that is what parity was established
+against. For 16 % of a short run and nothing at large canvases, it does not pay. Recorded, not built.
