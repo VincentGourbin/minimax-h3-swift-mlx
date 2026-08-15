@@ -41,7 +41,9 @@ first attempt breaks down: [docs/examples/fl2va](docs/examples/fl2va/README.md).
   + interleaved 3-axis mrope + deepstack injection for the `<Picture i>` presentation, causal
   CNN video VAE encoder for the conditioning rows, PIL-exact canvas preparation. The keyframe
   anchors the loop (noise-augmented at t = 0.999, never updated) while the prompt still drives
-  the action — see [the flying 2CV](docs/examples/fl2va/README.md)
+  the action. **All three modes run end to end**: `--image` (I2VA, start from it), `--last-image`
+  alone (L2VA, *arrive* at it), and both together (interpolate between them) — see
+  [the flying 2CV and the three anchors](docs/examples/fl2va/README.md)
 - Strict sequential loading fits full-precision bf16 in 96 GB unified memory
 - **Numeric parity vs the diffusers reference** (`minimax-h3 parity`, dumps via
   `scripts/parity_reference.py`): audio VAE max|Δ| 5e-6, video VAE 1.3e-5 (fp32) / 1.1e-2 (fp16
@@ -92,8 +94,6 @@ the prequantized export/load round-trip is validated bit-exact for every mode fa
 - MiniMax's sparse attention for H3 (still unpublished — their [MSA](https://github.com/MiniMax-AI/MSA)
   release is SM100 CUDA kernels, so only the algorithm transfers here) — the real unlock for
   full 768p speed
-- `--last-image` alone (L2VA) and first+last together share the fl2va code path but have not
-  been run end to end yet
 
 ## Requirements
 
