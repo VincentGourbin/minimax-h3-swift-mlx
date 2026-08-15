@@ -233,3 +233,28 @@ and per-head selection at speed needs a fused kernel that never materializes the
 which is exactly what MSA's CUDA release is. The complete substrate stays in the tree
 (`--sparse-attention`, indexer, audit tooling) for a future Metal-kernel project or a usable
 upstream release (action plan 405 watches). Until then, the standing win is `-s 20` (−33 %).
+
+---
+
+## Canonical references (2026-08-15) — and what they are NOT
+
+`minimax-h3 bench --tokens N --quant qint8`, measured on a **cold GPU** with five idle minutes
+before each point (mandatory — see [gpu-burst-vs-sustained](../pitfalls/gpu-burst-vs-sustained.md)).
+Stored machine-readably in [bench-reference.tsv](bench-reference.tsv); `scripts/bench-guard.sh`
+diffs against it at ±20 % and refuses to compare if the GPU reads busy at the start.
+
+| tokens | canvas | primitives total | measured step | bench vs reality |
+|---|---|---|---|---|
+| 3 712 | guard point | 25.0 s | — | — |
+| 8 998 | 576×384 / 124f | 76.1 s | 62.9 s | **+21 %** |
+| 24 005 | 576×384 / 345f | 353.4 s | 401 s | **−12 %** |
+| 39 930 | 1344×768 / 124f | 970.8 s | ~1 080 s (≈18 min) | **−10 %** |
+
+Reproducibility of the 9k point: 76.2 s and 76.1 s twenty minutes apart, against 75.5 s five days
+earlier — under 1 % of drift, which is what makes a ±20 % tripwire meaningful.
+
+**The sign flips with size, so this table is a tripwire and not a cost model.** The primitive sum
+overestimates the real step at 9k and underestimates it at 24k and 40k: small canvases pay ~18 %
+of glue the bench does not model, large ones pay a sustained-clock penalty the bench does not
+either, and the two errors point opposite ways. Detect movement with it; project a run with the
+measured step column, or better, with the tokens^1.9 law above.
