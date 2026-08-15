@@ -31,7 +31,7 @@ struct BenchDecodeCommand: AsyncParsableCommand {
     @Option(name: .long, help: "Batch sizes to sweep (decoder passes fused into one call).")
     var batches: String = "1,2,3,6"
 
-    @Option(name: .long, help: "Decoder passes in the run being modeled (576x384/124f = 42).")
+    @Option(name: .long, help: "Decoder passes to extrapolate the sweep over (576x384/124f = 42).")
     var tiles: Int = 42
 
     @Option(name: .long, help: "Timed repetitions per batch size (after one warmup).")
@@ -42,6 +42,24 @@ struct BenchDecodeCommand: AsyncParsableCommand {
 
     @Flag(name: .long, help: "Also time the blocks under MLX.compile.")
     var compileBlocks = false
+
+    /// The 576x384/124f reference run: 7 temporal chunks x a 2x3 tile grid.
+    static let referenceChunks = 7
+    static let referencePasses = 42
+
+    /// One decoder pass, identical in every geometry: 7 latent frames x a 16x16 latent tile
+    /// (a 256x256 px tile), + 4 register tokens + 1 cls.
+    static func passGeometry(_ config: H3VideoVAEConfig) -> (tokens: Int, flops: Double) {
+        let dim = config.decoderNumAttentionHeads * config.decoderAttentionHeadDim
+        let tokens = 7 * 16 * 16 + config.decoderNumRegisterTokens + 1
+        let perLayer = 3 * (dim * dim + dim) + dim * dim + dim
+            + dim * dim * config.decoderFfnMult * 2 + dim * config.decoderFfnMult * 2
+            + dim * config.decoderFfnMult * dim + dim
+        let params = config.decoderNumLayers * perLayer
+        let flops = 2.0 * Double(tokens) * Double(params)
+            + 4.0 * Double(tokens) * Double(tokens) * Double(dim) * Double(config.decoderNumLayers)
+        return (tokens, flops)
+    }
 
     @Flag(name: .long, help: "Time the REAL checkpoint's decode instead of the synthetic sweep.")
     var realVae = false
@@ -190,7 +208,10 @@ struct BenchDecodeCommand: AsyncParsableCommand {
 
         let sizes = batches.split(separator: ",").compactMap { Int($0) }.filter { $0 >= 1 }
         var baseline: Double?
-        print("  batch   s/call    s/pass   TFLOP/s   \(tiles) passes   vs batch 1")
+        // The ratio column is against the FIRST size swept, which is not necessarily 1 — labelling
+        // it "vs batch 1" would present a fused-throughput number as the sequential decode cost.
+        let baselineSize = sizes.first ?? 1
+        print("  batch   s/call    s/pass   TFLOP/s   \(tiles) passes   vs batch \(baselineSize)")
         print("  ─────────────────────────────────────────────────────────────────")
         for size in sizes {
             let input = MLXRandom.normal([size, tokens, dim]).asType(.float16)
@@ -239,8 +260,13 @@ struct BenchDecodeCommand: AsyncParsableCommand {
         // The blocks alone do not account for the measured phase, so time the rest at the real
         // shapes: the patch projection and its 8-D pixel-shuffle permute, the tile stitching, the
         // temporal chunk assembly, and the fp32 post-processing the pipeline runs inside the same
-        // phase timer. Shapes below are the 576x384/124f reference run.
-        let chunks = tiles / 6
+        // phase timer.
+        //
+        // These shapes are the 576x384/124f reference run and ONLY that run — the tile grid (2x3),
+        // the blend extents (128/96) and the frame count are all specific to it. `--tiles` scales
+        // the sweep's extrapolation column above; it does not reshape this table, so a 768p run
+        // (4x7 tiles, 7 chunks, 196 passes) would need its own geometry here.
+        let chunks = Self.referenceChunks
         let pixelFrames = latentFrames * config.temporalCompressionRatio          // 28 per pass
         let tilePx = latentSide * config.spatialCompressionRatio                  // 256
         let (canvasH, canvasW) = (384, 576)
@@ -321,7 +347,9 @@ struct BenchDecodeCommand: AsyncParsableCommand {
         stage("temporal blend + chunk concat", calls: 1) {
             var assembled = [MLXArray]()
             for index in 0..<chunks {
-                var chunk = clipPixels[0..., 0..., 3..., 0..., 0...]
+                // Production slices chunkNumFrames (20) then drops framePrePadding (3) -> 17 frames
+                // per chunk, which is what makes 7 chunks x 17 = 119 + the tail = 124 output frames.
+                var chunk = clipPixels[0..., 0..., 3..<20, 0..., 0...]
                 if index > 0 { chunk = blend(clipPixels, chunk, extent: 5, axis: 2) }
                 assembled.append(chunk)
             }
@@ -338,7 +366,8 @@ struct BenchDecodeCommand: AsyncParsableCommand {
             return (video[0].transposed(1, 2, 3, 0) * 255.0).round().asType(.uint8)
         }
 
-        print("\n  Everything around the 36 blocks, at the 576x384/124f shapes:")
+        print("\n  Everything around the 36 blocks, at the 576x384/124f shapes "
+            + "(\(Self.referencePasses) passes, \(Self.referenceChunks) chunks):")
         print("  ──────────────────────────────────────────────────────────────")
         var outside = 0.0
         for entry in stages {
@@ -348,7 +377,7 @@ struct BenchDecodeCommand: AsyncParsableCommand {
             print(String(format: "  %@ %7.3f s x%4d = %6.2f s",
                          label, entry.seconds, entry.calls, total))
         }
-        let blocksTotal = (baseline ?? 0) * Double(tiles)
+        let blocksTotal = (baseline ?? 0) * Double(Self.referencePasses)
         print(String(format: "  %@ %22.2f s",
                      "36 blocks".padding(toLength: 42, withPad: " ", startingAt: 0), blocksTotal))
         print(String(format: "  %@ %22.2f s  (measured phase: %.1f s)",
@@ -368,16 +397,20 @@ struct BenchDecodeCommand: AsyncParsableCommand {
         print(String(format: "  loaded and resident in %.1f s", Date().timeIntervalSince(loadStart)))
 
         // Reference run geometry: 576x384 / 124 frames -> 37 latent frames, 24x36 latent canvas.
+        // The pass count follows from THIS shape (7 chunks x 2x3 tiles), not from `--tiles`, which
+        // only scales the synthetic sweep's extrapolation.
         let latents = MLXRandom.normal([1, 24, 37, 24, 36]).asType(.float32)
         eval(latents)
+        let passes = Self.referencePasses
+        let flopsPerPass = Self.passGeometry(vae.config).flops
         for pass in 1...max(2, reps) {
             let start = Date()
             let decoded = vae.decode(latents)
             eval(decoded)
             let seconds = Date().timeIntervalSince(start)
             print(String(format: "  decode %d: %.1f s  (%.2f s per tile pass, %.2f TFLOP/s)",
-                         pass, seconds, seconds / Double(tiles),
-                         Double(tiles) * 9.64e12 / 1e12 / seconds))
+                         pass, seconds, seconds / Double(passes),
+                         Double(passes) * flopsPerPass / 1e12 / seconds))
             Memory.clearCache()
         }
     }

@@ -19,9 +19,23 @@ the same idle-looking machine on AC power, run at four different moments:
 | **after 5 idle minutes** | **1.139** | **8.46** |
 
 The last row is the point: the machine *recovers* to within three thousandths of the first
-measurement. Nothing was contending — `Device Utilization %` reads 10 % when nothing of ours runs,
-and 99–100 % during our own run in every one of those states. `pmset -g therm` records no thermal
-warning. It is the GPU's power/clock state, not another process and not the code.
+measurement, so the swing is a machine state that comes and goes, not code and not noise.
+
+**The cause is NOT established, and a later observation broke the first explanation.** These runs
+were originally attributed to the GPU's power/clock state, because spot-checking
+`Device Utilization %` between them read 10 % and `pmset -g therm` recorded no thermal warning.
+Hours later the same slow readings reappeared — and this time the GPU held **81–97 % for thirty
+seconds with nothing of ours running**, driven by `spotlightknowledged` at 97 % CPU: macOS was
+indexing the media files that a remounted volume and our own freshly written MP4s had handed it.
+
+So there are at least two mechanisms that produce an identical signature, and three spot samples
+are not enough to tell them apart:
+
+- an external GPU consumer, most plausibly Spotlight's media/knowledge indexing — which **our own
+  runs summon**, since every generation writes an MP4 and every remount re-triggers indexing;
+- the GPU's own clock state under sustained load.
+
+What is certain is the operational consequence, which is the same either way.
 
 ## What this invalidates
 
@@ -35,6 +49,10 @@ warning. It is the GPU's power/clock state, not another process and not the code
 
 ## The protocol
 
+0. **Verify the machine is quiet, do not assume it.** Sample `Device Utilization %` for ~30 s with
+   nothing of yours running, not three times over ten seconds, and check
+   `ps -Aro pid,pcpu,comm | grep -iE "spotlight|mediaanalysis|photoanalysis"`. A single spot check
+   at 10 % is exactly what this pitfall showed to be misleading.
 1. Benchmark from a **cold GPU**: at least 5 idle minutes before the first point.
 2. Cooldown **before every point**, not just the first — the second variant otherwise runs hot
    and loses on thermals rather than on merit.
