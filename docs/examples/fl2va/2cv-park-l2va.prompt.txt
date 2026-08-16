@@ -1,0 +1,7 @@
+How the reference pictures align with the target video — <Picture 1> (from [Shot 1]) aligns with the 5.17-second mark of the target video.
+
+integrated_multimodal_description: [Shot 1] Cinematic, locked-off medium side profile shot of a gravel forecourt in front of a dense green hedge and an iron fence. A vibrant red Citroen 2CV rolls slowly into frame from the left, tires crunching over the gravel, decelerates smoothly, and comes to a complete stop in the centre of the frame, settling level on its soft suspension and holding perfectly still for the final second. The camera never moves.
+
+overall_soundscape: Gravel crunching under slowly rolling tires and the soft putter of a small air-cooled engine; the crunching fades as the car halts, the engine cuts, and birdsong and light wind in the leaves take over.
+
+non_diegetic_music: None.

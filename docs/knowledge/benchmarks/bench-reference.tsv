@@ -1,0 +1,15 @@
+# Canonical `minimax-h3 bench` references — what scripts/bench-guard.sh diffs against.
+# Measured on a COLD GPU (5 idle minutes before each point); see pitfalls/gpu-burst-vs-sustained.md.
+# A hot-GPU run can be 10x slower and will fail the guard for no reason.
+#
+# This is a REGRESSION TRIPWIRE, not a cost model: the primitive sum overestimates the real step by
+# 21 % at 9k tokens and underestimates it by 10-12 % at 24k-40k. Use it to detect movement, never
+# to project a run — for that, see step-cost-map-2026-08.md.
+#
+# Update a row only with a fresh cold measurement, and say why in docs/knowledge/log.md.
+#
+# tokens	quant	primitives_total_s	canvas	device	date
+3712	qint8	25.0	guard point (fast)	Apple M3 Max 96GB	2026-08-15
+8998	qint8	76.1	576x384/124f	Apple M3 Max 96GB	2026-08-15
+24005	qint8	353.4	576x384/345f	Apple M3 Max 96GB	2026-08-15
+39930	qint8	970.8	1344x768/124f	Apple M3 Max 96GB	2026-08-15

@@ -11,7 +11,7 @@ struct MiniMaxH3CLI: AsyncParsableCommand {
         commandName: "minimax-h3",
         abstract: "MiniMax-H3 joint video + stereo audio generation on Apple Silicon (MLX).",
         version: MiniMaxH3.version,
-        subcommands: [GenerateCommand.self, EnhanceCommand.self, MuxCommand.self, ExportQuantizedCommand.self, SmokeCommand.self, ParityCommand.self, BenchCommand.self, InfoCommand.self],
+        subcommands: [GenerateCommand.self, EnhanceCommand.self, MuxCommand.self, ExportQuantizedCommand.self, SmokeCommand.self, ParityCommand.self, BenchCommand.self, BenchDecodeCommand.self, InfoCommand.self],
         defaultSubcommand: InfoCommand.self
     )
 }

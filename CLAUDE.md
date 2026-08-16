@@ -65,10 +65,10 @@ Sources/MiniMaxH3/
   Scheduler/H3Scheduler.swift
   Models/Transformer/        # H3Transformer (50 blocks + 2 refiner, AdaLN table, MM-RoPE)
   Models/TextEncoder/        # Qwen3VLTextEncoder (layers 0..<50, unnormalized output)
-  Models/VAE/                # video VAE (TODO)
-  Models/AudioVAE/           # audio VAE (TODO)
+  Models/VAE/                # video VAE: causal CNN encoder (keyframes) + 36-block ViT decoder
+  Models/AudioVAE/           # audio VAE (BigVGAN-style, 32 kHz stereo)
   Loading/WeightLoader.swift # sharded safetensors + key remap + strict diagnostics
-Sources/MiniMaxH3CLI/
+Sources/MiniMaxH3CLI/        # generate, enhance, mux, parity, bench, bench-decode, smoke, info
 ```
 
 ## Key implementation facts (do not re-derive)
@@ -84,6 +84,36 @@ Sources/MiniMaxH3CLI/
   rest bf16. AdaLN: SiLU in fp32 → cast bf16 → linear. `norm_out` order: shift THEN scale.
 - Weight key remaps: `to_out.0→to_out`, `ff.net.0.proj→ff.proj`, `ff.net.2→ff.out`.
 - All checkpoint RMSNorms are affine (have weights).
+
+## Performance work — read this before measuring anything
+
+**The GPU's clock state moves results by up to 10×.** The same Release binary, same shapes, same
+Mac on AC power, measured 1.14 / 11.1 / 2.25 / 1.70 s per identical unit of work depending on when
+it ran — and came back to 1.139 after five idle minutes. A short bench on a cold GPU therefore
+*overstates* the machine for any sustained phase. Full account:
+`docs/knowledge/pitfalls/gpu-burst-vs-sustained.md`. Practical rules:
+
+- Cool down before **every** point, not just the first, and alternate variants (A/B/B/A).
+- Always carry a control sample in the same thermal state. That discipline has reversed three
+  conclusions in this repo; without it, the second variant loses on thermals, not on merit.
+- Judge a difference only against the intra-variant spread (~±2 % with the protocol).
+
+Tools, none of which need the 163 GB checkout:
+
+```bash
+minimax-h3 bench --tokens 8998 --quant qint8   # denoising-step primitives, ~19 s
+minimax-h3 bench-decode --batches 1,2,3,6      # video VAE decode passes (+ --real-vae for the checkpoint)
+scripts/bench-guard.sh 8998 20                 # regression tripwire vs docs/knowledge/benchmarks/bench-reference.tsv
+```
+
+`bench-guard.sh` self-calibrates: it replays the cheap 3712-token point until the machine is back
+in its reference state, and refuses to conclude otherwise. Update `bench-reference.tsv` only with
+a fresh cold measurement, and say why in `docs/knowledge/log.md`.
+
+Two closed investigations to avoid re-opening blind: block-sparse attention (per-head selection is
+required for fidelity and makes the pure-MLX gather slower than dense — a fused Metal kernel is the
+only path, issue #2) and the VAE decode (it saturates the GPU; the profiler's "49 %" is a sampled
+device average, and direct sampling reads 99–100 %).
 
 ## Engineering Knowledge Base
 

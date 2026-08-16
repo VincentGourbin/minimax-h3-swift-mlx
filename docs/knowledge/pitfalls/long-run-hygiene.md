@@ -66,3 +66,25 @@ diffusers, since canvas preparation is already covered bit-exactly by `keyframe-
 - Arm `caffeinate -is -w <pid>`.
 - Keep the launch reproducible in a script (`.local-runs/run-*.sh`) so a relaunch is one command.
 - Judge health by CPU-time delta, not by instantaneous %CPU.
+
+## The weights volume can degrade to EPERM without unmounting (2026-08-15)
+
+New failure mode, distinct from the unmount-wedge above. Mid-session, every *content* read on the
+exFAT/fskit external volume started returning `Operation not permitted` — `ls /Volumes/Lexar`
+included — while the volume stayed mounted and `stat` still answered correctly with sizes and
+modes. It hit every process equally: the agent's shell, a plain Terminal, and the CLI itself,
+which died with `The file "tokenizer.json" couldn't be opened because you don't have permission
+to view it` before any GPU work. The same paths had been read successfully an hour earlier in the
+same session.
+
+**Fix: remount.** `diskutil unmount /Volumes/Lexar && diskutil mount disk4s1` restored access
+immediately, no reboot, no permission dialog, no System Settings change.
+
+Diagnosis, in order — it takes seconds and saves chasing a phantom TCC problem:
+1. `stat` a file on the volume. If metadata works and `cat` returns EPERM, it is the volume layer,
+   not file permissions (exFAT is mounted `noowners`, so the displayed `-rwx------` is synthetic).
+2. Check whether a *different* process sees the same thing. If Terminal fails too, stop suspecting
+   the sandbox or the agent.
+3. `lsof +D /Volumes/<name>` — in this instance CleanMyMac was holding a handle on `.Trashes` and
+   scanning the volume. Not proven to be the cause, but a cleaner crawling the checkpoint volume
+   during a multi-hour run is a hazard worth excluding on its own.

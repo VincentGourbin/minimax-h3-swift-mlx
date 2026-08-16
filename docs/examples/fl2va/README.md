@@ -1,9 +1,15 @@
 # fl2va — keyframe-conditioned generation
 
-The video starts from an image you provide. The canvas adopts that image's aspect ratio, the
-keyframe goes through the Qwen3-VL vision tower (as a `<Picture 1>` reference in the prompt) and
-through the video VAE encoder (as conditioning rows that anchor the denoising loop), and the
-prompt says what happens next.
+You pin the video to one or two images you provide. Each keyframe goes through the Qwen3-VL vision
+tower (as a `<Picture i>` reference in the prompt) *and* through the video VAE encoder (as
+conditioning rows that anchor the denoising loop, noise-augmented at t = 0.999 and never updated),
+and the prompt says what happens around them. Three modes, all shown below:
+
+| flag | mode | the image is | canvas |
+|---|---|---|---|
+| `--image` | I2VA | the **first** frame | stretched from that image |
+| `--last-image` | L2VA | the **last** frame — the video *arrives* at it | stretched from that image |
+| both | FL2VA | both ends pinned | first image's aspect; the second is cover-cropped onto it |
 
 ---
 
@@ -131,6 +137,86 @@ non-negotiable — is doing exactly its job.
 
 This also answers the two questions the shorter clips left open: coherence holds over 14 seconds,
 and the scene ends cleanly instead of dissolving, unlike the first 2CV flight above.
+
+---
+
+## Arriving on a photograph — `--last-image` alone (L2VA)
+
+The two clips above start from the photograph. This one has to *end* on it: the model is given
+**only the destination** and must invent the five seconds that lead there. Same 2CV photo, used as
+the last frame instead of the first.
+
+```bash
+minimax-h3 generate "$(cat 2cv-park-l2va.prompt.txt)" --last-image 2cv-input.jpg \
+  -W 576 -H 384 -f 124 -s 20 --seed 0 \
+  --transformer-quant qint8 --text-encoder-quant qint8 -o 2cv-park-l2va.mp4
+```
+
+The prompt's first line is what makes it an L2VA request — the alignment line points the picture at
+the *end* of the clip rather than at 0.00 s:
+
+```
+How the reference pictures align with the target video — <Picture 1> (from [Shot 1]) aligns with the 5.17-second mark of the target video.
+```
+
+### Result
+
+▶ [2cv-park-l2va-576x384.mp4](2cv-park-l2va-576x384.mp4) — 576×384, 124 frames (5.2 s), 19 sigma
+steps, qint8, 40 min on an M3 Max.
+
+![frames, one in twelve](2cv-park-l2va-contact-sheet.png)
+
+The car rolls in from the left, decelerates, and settles into exactly the photograph — stickers on
+the rear quarter window, antenna, chrome bumper, the same hedge and gravel.
+
+**How close is "exactly"?** Against the keyframe, the first frame scores 12.7 dB PSNR and the last
+21.8 dB. The convergence is the point: the trajectory is invented, the destination is not.
+
+**An honest oddity**: the car drives in *backwards*, nose to the left, because the keyframe fixes
+its final orientation and the prompt asked it to arrive from the left. Faced with a contradiction,
+the model kept the keyframe and gave up the physics.
+
+---
+
+## Both ends pinned — `--image` + `--last-image` (FL2VA)
+
+The hardest of the three: start on one image, land on another, and make the path between them
+plausible. First frame is the parked photograph; last frame is a frame taken from the flying-2CV
+clip at the top of this page.
+
+```bash
+minimax-h3 generate "$(cat 2cv-liftoff-fl2va.prompt.txt)" \
+  --image 2cv-input.jpg --last-image 2cv-fly-frame.png \
+  -W 576 -H 384 -f 124 -s 20 --seed 0 \
+  --transformer-quant qint8 --text-encoder-quant qint8 -o 2cv-liftoff-fl2va.mp4
+```
+
+### Result
+
+▶ [2cv-liftoff-fl2va-576x384.mp4](2cv-liftoff-fl2va-576x384.mp4) — 576×384, 124 frames (5.2 s),
+19 sigma steps, qint8, 43 min on an M3 Max.
+
+![frames, one in twelve](2cv-liftoff-fl2va-contact-sheet.png)
+
+The car lifts off the gravel, the camera tilts up with it, and the background transitions in the
+right order — hedge and iron fence, then treetops, then open white sky — arriving on the second
+keyframe.
+
+**Both ends verified against each other**, which is what makes the numbers mean something:
+
+| comparison | PSNR |
+|---|---|
+| first frame vs keyframe 1 (parked) | **21.8 dB** |
+| last frame vs keyframe 2 (airborne) | **19.7 dB** |
+| cross-check — first frame vs keyframe 2 | **6.3 dB** |
+
+Without the cross-check, 21.8 dB could just mean "two pictures of a red 2CV look alike". At 6.3 dB
+the cross-check says otherwise. And 21.8 dB is the same score the L2VA clip gets on its *last*
+frame — anchor fidelity does not depend on which end the anchor sits at.
+
+The soundscape follows the climb, −20 dB at the start to −9.6 dB by the fourth second, and sits
+30 dB above the quiet L2VA scene — the prompt's soundscape section drives the mix, as it does
+everywhere else here.
 
 ---
 
