@@ -27,7 +27,13 @@ timecode named (versus −44 dB during the hover).
 |---|
 | ![2cv launch](docs/examples/fl2va/2cv-launch-contact-sheet.png) |
 
-Input image, exact prompts, settings, audio envelope and an honest look at where the shorter
+The same photograph also anchors the other two modes: [arriving *on* it](docs/examples/fl2va/2cv-park-l2va-576x384.mp4)
+with `--last-image` alone (the model is given only the destination and invents the five seconds
+that lead there), and [lifting off between two keyframes](docs/examples/fl2va/2cv-liftoff-fl2va-576x384.mp4)
+with both flags — first frame 21.8 dB against keyframe 1, last 19.7 dB against keyframe 2, and
+6.3 dB on the cross-check that keeps those numbers honest.
+
+Input images, exact prompts, settings, audio envelopes and an honest look at where the shorter
 first attempt breaks down: [docs/examples/fl2va](docs/examples/fl2va/README.md).
 
 
@@ -171,7 +177,20 @@ minimax-h3 generate "un renard trotte dans la neige" --enhance-prompt -o fox.mp4
 
 # Rebuild an MP4 from a saved raw result (written automatically before every mux)
 minimax-h3 mux fox.raw.safetensors -o fox2.mp4 --normalize-audio
+
+# Performance work — none of these need the checkpoint, they run on synthetic weights
+minimax-h3 bench --tokens 8998 --quant qint8    # denoising-step primitives, ~19 s
+minimax-h3 bench-decode --batches 1,2,3,6       # video VAE decode passes
+scripts/bench-guard.sh 8998 20                  # regression tripwire vs the stored cold references
 ```
+
+**Before you benchmark anything**: the same binary on the same Mac has measured 10× apart
+depending on what the GPU was doing minutes earlier — including background media indexing that
+your own runs trigger by writing MP4s. Cool down before *every* point, carry a control sample in
+the same state, and verify the machine is quiet with sustained sampling rather than a spot check:
+[docs/knowledge/pitfalls/gpu-burst-vs-sustained.md](docs/knowledge/pitfalls/gpu-burst-vs-sustained.md).
+`scripts/bench-guard.sh` enforces this for you and refuses to conclude when the machine will not
+settle.
 
 **Prompting**: H3 is trained on structured Context-IR prompts (`integrated_multimodal_description:`
 / `overall_soundscape:` / `non_diegetic_music:` sections, `[Shot N]` timecodes). Audio loudness is
