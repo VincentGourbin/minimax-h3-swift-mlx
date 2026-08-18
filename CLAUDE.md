@@ -8,7 +8,8 @@ generation on Apple Silicon. 33B guidance-distilled DiT + Qwen3-VL-32B condition
 
 **INSTRUCTIONS.md is the porting spec** — read it before touching model code. It captures the
 complete architecture, the packing geometry, and the fidelity traps extracted from the diffusers
-reference (branch `minimax-h3`, PR #14355).
+reference (PR #14355, **merged into diffusers `main` on 2026-08-05**; not in a tagged
+release yet — v0.39.0 predates it).
 
 ## Build & Test Commands
 
@@ -123,6 +124,7 @@ something new or measure something durable, add a concept file + a line in `docs
 ## Reference code
 
 Diffusers reference clone lives in the session scratchpad during active work; re-clone with:
-`git clone --depth 1 --branch minimax-h3 https://github.com/huggingface/diffusers.git`
+`git clone --depth 1 https://github.com/huggingface/diffusers.git` (H3 is on `main` since
+2026-08-05; the old `minimax-h3` PR branch is obsolete)
 Files: `models/transformers/transformer_minimax_h3.py`, `schedulers/scheduling_minimax_h3.py`,
 `modular_pipelines/minimax_h3/*.py`, `models/autoencoders/autoencoder_kl_minimax_h3{,_audio}.py`.
