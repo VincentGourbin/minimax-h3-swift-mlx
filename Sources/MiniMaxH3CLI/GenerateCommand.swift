@@ -71,6 +71,12 @@ struct GenerateCommand: AsyncParsableCommand {
     @Flag(name: .long, help: "Graph-compile the transformer blocks (fused kernels, same math).")
     var compileBlocks = false
 
+    @Option(name: .long, help: "Step-distillation LoRA (.safetensors) folded into the transformer; 4-step Turbo adapters want -s 5, 8-step ones -s 9.")
+    var turboLora: String?
+
+    @Option(name: .long, help: "Multiplier on the folded LoRA delta (sharpness dial; 1.0 = as published).")
+    var turboLoraStrength: Double = 1.0
+
     @Option(name: .long, help: "Block-sparse attention: fraction of key blocks kept per query block (e.g. 0.3). Approximation — validate against a full-attention run.")
     var sparseAttention: Double?
 
@@ -163,6 +169,21 @@ struct GenerateCommand: AsyncParsableCommand {
         request.transformerQuantization = transformerQuantization
         request.textEncoderQuantization = textEncoderQuantization
         request.compileBlocks = compileBlocks
+        if let turboLora {
+            let url = URL(fileURLWithPath: turboLora)
+            guard FileManager.default.fileExists(atPath: url.path) else {
+                throw ValidationError("--turbo-lora: no file at \(url.path)")
+            }
+            request.turboLoRA = url
+            request.turboLoRAStrength = Float(turboLoraStrength)
+            // The adapters are distilled for a specific evaluation count; running one at the 50-point
+            // default wastes an hour before anyone notices the mismatch.
+            let evaluations = steps - 1
+            if evaluations > 12 {
+                print("Note: --turbo-lora with -s \(steps) means \(evaluations) transformer "
+                    + "evaluations. The published adapters are distilled for 4 (-s 5) or 8 (-s 9).")
+            }
+        }
         if let sparseAttention {
             guard sparseAttention > 0, sparseAttention < 1 else {
                 throw ValidationError("--sparse-attention must be in (0, 1).")

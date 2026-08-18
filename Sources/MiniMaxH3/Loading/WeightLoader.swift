@@ -78,11 +78,16 @@ public enum H3WeightLoader {
     ///   - numLayers: block count to materialize (parity harnesses use 1; nil = all).
     ///   - quantization: on-the-fly quantization applied after the weights land (MiniMax's
     ///     exclusion list keeps the fp32 modules, refiner and output norm at full precision).
+    /// - Parameter turboLoRA: a step-distillation LoRA to fold into the weights before
+    ///   quantization (see `H3TurboLoRA`). Folding needs the bf16 stage, so passing one disables
+    ///   the prequantized fast path rather than quietly loading un-adapted weights.
     public static func loadTransformer(
         modelDirectory: URL,
         numLayers: Int? = nil,
         quantization: H3Quantization = .none,
-        skipPrequantizedPickup: Bool = false
+        skipPrequantizedPickup: Bool = false,
+        turboLoRA: URL? = nil,
+        turboLoRAStrength: Float = 1.0
     ) throws -> H3Transformer {
         let directory = modelDirectory.appendingPathComponent("transformer")
         var config = try H3TransformerConfig.load(from: directory.appendingPathComponent("config.json"))
@@ -91,7 +96,7 @@ public enum H3WeightLoader {
 
         // Prequantized fast path: quantize the (lazy) structure with the same filter, then load
         // the exported parameters — reads ~18.5 GB instead of 62 at qint8.
-        if !skipPrequantizedPickup, numLayers == nil,
+        if !skipPrequantizedPickup, numLayers == nil, turboLoRA == nil,
            H3PrequantizedCheckpoint.exists(
                modelDirectory: modelDirectory, component: "transformer", quantization: quantization) {
             H3QuantizationFilter.apply(
@@ -106,16 +111,23 @@ public enum H3WeightLoader {
             return model
         }
 
-        let weights = try loadShardedWeights(directory: directory) { key in
+        // diffusers module names -> our @ModuleInfo keys. The LoRA ships against the same
+        // diffusers tree, so its targets go through the identical rewrite.
+        func transformerRemap(_ key: String) -> String {
+            key.replacingOccurrences(of: ".to_out.0.", with: ".to_out.")
+                .replacingOccurrences(of: ".ff.net.0.proj.", with: ".ff.proj.")
+                .replacingOccurrences(of: ".ff.net.2.", with: ".ff.out.")
+        }
+        var weights = try loadShardedWeights(directory: directory) { key in
             if let numLayers, key.hasPrefix("transformer_blocks.") {
                 let layerIndex = Int(key.split(separator: ".")[1]) ?? .max
                 guard layerIndex < numLayers else { return nil }
             }
-            // diffusers module names -> our @ModuleInfo keys.
-            return key
-                .replacingOccurrences(of: ".to_out.0.", with: ".to_out.")
-                .replacingOccurrences(of: ".ff.net.0.proj.", with: ".ff.proj.")
-                .replacingOccurrences(of: ".ff.net.2.", with: ".ff.out.")
+            return transformerRemap(key)
+        }
+        if let turboLoRA {
+            try H3TurboLoRA.fold(
+                into: &weights, from: turboLoRA, strength: turboLoRAStrength, remap: transformerRemap)
         }
         try apply(weights: weights, to: model, component: "transformer")
         if quantization != .none {

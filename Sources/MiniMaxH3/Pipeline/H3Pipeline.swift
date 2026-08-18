@@ -39,6 +39,12 @@ public struct H3GenerationRequest: Sendable {
     public var textEncoderQuantization: H3Quantization = .none
     /// Graph-compile each transformer block (`MLX.compile`): same math, fused elementwise glue.
     public var compileBlocks = false
+
+    /// Step-distillation LoRA folded into the transformer before quantization. The published
+    /// Turbo adapters expect 4 or 8 transformer evaluations, i.e. `numInferenceSteps` 5 or 9.
+    public var turboLoRA: URL?
+    /// Extra multiplier on the folded delta; the LoRA cards use this as a sharpness dial.
+    public var turboLoRAStrength: Float = 1.0
     /// Block-sparse attention keep fraction (nil = full attention). Approximation, opt-in.
     public var sparseAttentionKeep: Float?
 
@@ -288,7 +294,8 @@ public final class H3Pipeline {
         report("Loading transformer (61.7 GB)")
         profiler.start("Load Transformer")
         var transformer: H3Transformer? = try H3WeightLoader.loadTransformer(
-            modelDirectory: modelDirectory, quantization: request.transformerQuantization)
+            modelDirectory: modelDirectory, quantization: request.transformerQuantization,
+            turboLoRA: request.turboLoRA, turboLoRAStrength: request.turboLoRAStrength)
         transformer!.compileBlocks = request.compileBlocks
         transformer!.sparseAttentionKeep = request.sparseAttentionKeep
         Memory.clearCache()
