@@ -294,10 +294,22 @@ to this scene, and losing it at 15 points is a real loss of a discrete audio eve
 level collapse it was recorded as.
 
 **What this changes.** The `-s 20` recommendation stands, but it now rests where it always
-belonged: on the human review of motion smoothness (15 judders, 20 does not), not on an audio
-number that turned out to describe one transient. 18 points hold that transient and are 10 % cheaper
-than 20 — but no one has watched an 18-point clip move, and stills cannot answer that question. It
-stays unrecommended until someone does.
+belonged: on the human review of motion smoothness, not on an audio number that turned out to
+describe one transient.
+
+**18 points: rejected on human review (2026-08-18).** They keep the transient, cost 10 % less than
+20, and every metric we have said they were fine — and the moving clip is visibly **noisy**,
+residual grain the denoiser had not finished removing. So the floor is 20, and the grid now has
+three rejections in a row that no automatic measurement predicted:
+
+| grid point | what the metrics said | what human review said |
+|---|---|---|
+| 20 | audio stable, frames clean | **accepted** — smooth |
+| 18 | audio transient preserved, frames clean | **rejected** — residual noise in motion |
+| 15 | audio "collapse" (a mismeasurement), frames clean | **rejected** — judder |
+
+Three times the stills and the levels were clean and the played video was not. **The sigma floor is
+a human-review quantity in this repo**; treat any metric-only sigma recommendation as unvalidated.
 
 **Method note.** The metric was the bug. A whole-clip peak on a 5-second file is one sample of one
 instant; splitting body from tail took two ffmpeg calls and inverted the conclusion. When a level
