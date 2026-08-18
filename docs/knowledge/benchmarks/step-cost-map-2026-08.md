@@ -150,6 +150,9 @@ frame by frame:
   30→20 stability against the 20→15 drop makes fewer-steps audio degradation the more likely
   reading. The audio scheduler's shift-3 grid loses proportionally more of its low-σ tail than
   the video's shift-12 grid does.
+  → **Amended 2026-08-18, see the curve below: this 10 dB "drop" is one transient in the final
+  0.17 s, not the scene level.** The reading above was drawn from a whole-clip peak and does not
+  survive splitting the clip.
 
 - **Motion: 15 is out.** Human review of the moving video found visible judder at 15 points —
   an artifact stills can never catch, which is why the frame grid above looked clean. Frame-level
@@ -258,3 +261,44 @@ overestimates the real step at 9k and underestimates it at 24k and 40k: small ca
 of glue the bench does not model, large ones pay a sustained-clock penalty the bench does not
 either, and the two errors point opposite ways. Detect movement with it; project a run with the
 measured step column, or better, with the tokens^1.9 law above.
+
+
+## The sigma-audio curve (2026-08-18) — and what the whole-clip peak was really measuring
+
+Issue #5, item 3: locate the cliff the study above flagged between 20 and 15 points. Two grid
+points were missing (25 and 18); the 30/20/15 clips from 2026-08-11 are reusable as-is because
+generation is deterministic at a fixed seed and the settings are identical (fox prompt, seed 0,
+576×384/124f, qint8). Levels are dBFS peak.
+
+| sigma points | whole clip | body (0–5.0 s) | tail (5.0–5.17 s) |
+|---|---|---|---|
+| 30 | −35.0 | −44.6 | −35.0 |
+| 25 | −34.4 | −44.9 | −34.4 |
+| 20 | −34.6 | −46.8 | −34.6 |
+| 18 | −34.4 | −46.8 | −34.4 |
+| 15 | −45.3 | −47.6 | −45.3 |
+
+**There is no cliff in the scene's audio.** The body of the clip declines gently and monotonically,
+3 dB across the whole 30 → 15 range. What the earlier study measured as a 10 dB collapse is a
+single transient living in the **last 0.17 s** — present at 30/25/20/18, absent at 15. The
+whole-clip peak is that transient at every grid point; it never came from the scene.
+
+Per-second peaks confirm it: seconds 0–4 read −47 to −48 dB at *both* 18 and 15 points, identical
+within half a dB, while the whole-clip peaks differ by 11 dB.
+
+**Is the transient an artifact of ours?** It would be a tidy story — an end-of-clip pop in the
+audio tail — and it is wrong. Checked against six unrelated outputs (both 2CV keyframe runs, the
+flying 2CV, the 14.4 s launch, the 768p fox, the t2va showcase), the final 0.2 s is never louder
+than the body; the launch clip ends 52 dB below it. So the transient is generated content specific
+to this scene, and losing it at 15 points is a real loss of a discrete audio event — just not the
+level collapse it was recorded as.
+
+**What this changes.** The `-s 20` recommendation stands, but it now rests where it always
+belonged: on the human review of motion smoothness (15 judders, 20 does not), not on an audio
+number that turned out to describe one transient. 18 points hold that transient and are 10 % cheaper
+than 20 — but no one has watched an 18-point clip move, and stills cannot answer that question. It
+stays unrecommended until someone does.
+
+**Method note.** The metric was the bug. A whole-clip peak on a 5-second file is one sample of one
+instant; splitting body from tail took two ffmpeg calls and inverted the conclusion. When a level
+"collapses", ask *where in the clip* before asking why.
