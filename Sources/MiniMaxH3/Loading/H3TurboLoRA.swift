@@ -42,6 +42,7 @@ public enum H3TurboLoRA {
         into weights: inout [String: MLXArray],
         from url: URL,
         strength: Float = 1.0,
+        requireMatch: Bool = true,
         remap: (String) -> String
     ) throws -> Int {
         let (adapter, metadata) = try loadArraysAndMetadata(url: url)
@@ -87,14 +88,19 @@ public enum H3TurboLoRA {
                         + "\(original.shape)")
             }
             weights[targetKey] = (original.asType(.float32) + delta).asType(original.dtype)
+            // Evaluate NOW, one tensor at a time. Deferring to a single eval() at the end builds a
+            // lazy graph holding an fp32 copy of every touched weight on top of the 61.7 GB of bf16
+            // already resident — the first run of this code was killed by the OS at that point,
+            // silently, with no error to read. Per-tensor eval keeps the transient at two copies of
+            // the largest weight (~1.2 GB for the feed-forward projection).
+            eval(weights[targetKey]!)
             folded += 1
         }
-        eval(Array(weights.values))
 
         // A LoRA that matches nothing is a silent no-op otherwise: the run would take the Turbo
         // step count with un-adapted weights and produce noise, which looks like a quality problem
         // rather than a loading problem.
-        guard folded > 0 else {
+        guard folded > 0 || !requireMatch else {
             throw H3Error.invalidConfiguration(
                 "LoRA \(url.lastPathComponent) targets no known weight — first miss: "
                     + (missing.first ?? "n/a"))
