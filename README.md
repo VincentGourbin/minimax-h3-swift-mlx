@@ -178,6 +178,13 @@ minimax-h3 generate "un renard trotte dans la neige" --enhance-prompt -o fox.mp4
 # Rebuild an MP4 from a saved raw result (written automatically before every mux)
 minimax-h3 mux fox.raw.safetensors -o fox2.mp4 --normalize-audio
 
+# Turbo LoRA: fold a step-distillation adapter in once, then run at 8 evaluations
+# (~2x faster end to end, with speech intact — see the table below)
+minimax-h3 merge-lora --lora minimax_h3_fl2v_turbo_8step_v1.0_bf16.safetensors \
+  --models-dir "$H3_MODELS_DIR" --out "$H3_MODELS_DIR/../MiniMax-H3-turbo8"
+minimax-h3 export-quantized transformer --quant qint8 --models-dir .../MiniMax-H3-turbo8
+minimax-h3 generate "..." --models-dir .../MiniMax-H3-turbo8 -s 9 -o fast.mp4
+
 # Performance work — none of these need the checkpoint, they run on synthetic weights
 minimax-h3 bench --tokens 8998 --quant qint8    # denoising-step primitives, ~19 s
 minimax-h3 bench-decode --batches 1,2,3,6       # video VAE decode passes
@@ -191,6 +198,22 @@ the same state, and verify the machine is quiet with sustained sampling rather t
 [docs/knowledge/pitfalls/gpu-burst-vs-sustained.md](docs/knowledge/pitfalls/gpu-burst-vs-sustained.md).
 `scripts/bench-guard.sh` enforces this for you and refuses to conclude when the machine will not
 settle.
+
+**Turbo LoRAs** ([lightx2v/Minimax-h3-Turbo](https://hf.co/lightx2v/Minimax-h3-Turbo), Apache-2.0,
+used by MiniMaxAI's own Space) distil the schedule to 4 or 8 transformer evaluations. Their grid is
+already ours — same shifts, points at `(N-i)/N` — so NFE 4 is `-s 5` and NFE 8 is `-s 9`. Folding
+happens **offline** via `merge-lora`, one shard at a time: folding at load time materializes ~55 GB
+that was memory-mapped and gets the process killed. Measured on 576×384/124f, same prompt and seed:
+
+| setting | evaluations | wall time | articulated speech |
+|---|---|---|---|
+| base checkpoint, `-s 20` | 19 | 34 min | **intelligible** |
+| 8-step LoRA, `-s 9` | 8 | **17 min** | **intelligible** |
+| 4-step LoRA, `-s 5` | 4 | **10 min** | **fails** |
+
+The 4-step adapter is a fine "no dialogue" mode — it even renders a spoken countdown the base
+checkpoint drops — but a close-up talking head comes out unintelligible. Audio envelopes do not
+predict this: all three put their RMS maximum on the stressed final word.
 
 **Prompting**: H3 is trained on structured Context-IR prompts (`integrated_multimodal_description:`
 / `overall_soundscape:` / `non_diegetic_music:` sections, `[Shot N]` timecodes). Audio loudness is
