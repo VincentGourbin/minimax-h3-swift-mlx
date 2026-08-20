@@ -76,7 +76,8 @@ Two things follow, and both correct what is written above:
    (that model said 209 s; reality said 401 s). Estimates made from the primitive breakdown
    therefore *understate* large runs by about 2×. Use the measured exponent for projections until
    the discrepancy is understood — attention's real share at large sizes is probably higher than
-   the bench's 49 %.
+   the bench's 49 %. → **Confirmed at 74 000 tokens on 2026-08-20 (see the third clean point
+   below): the exponent measures 1.86 there, so the law extends across the port's whole range.**
 
 ## MLX.compile on the production blocks: bit-exact, roughly neutral
 
@@ -314,3 +315,36 @@ a human-review quantity in this repo**; treat any metric-only sigma recommendati
 **Method note.** The metric was the bug. A whole-clip peak on a 5-second file is one sample of one
 instant; splitting body from tail took two ffmpeg calls and inverted the conclusion. When a level
 "collapses", ask *where in the clip* before asking why.
+
+---
+
+## Third clean point (2026-08-20) — 74 000 tokens, and the law holds
+
+`generate -W 1344 -H 768 -f 243 -s 5 --profile` on MiniMax's own reproducible 768p T2VA case
+(starship bridge, 10.125 s, seed 0), run with the 4-step Turbo LoRA folded in:
+
+| | value |
+|---|---|
+| packed sequence | ~74 000 tokens (1.85× the previous maximum) |
+| per evaluation | **54 min 21, σ 2 min 23** over 4 evaluations |
+| denoising | 217 min (92.4 % of the run), GPU 66 % |
+| VAE decode | 16 min 30 for **392 decoder passes** (14 chunks × a 4×7 tile grid), GPU 49 % |
+| **peak MLX** | **34.5 GB** |
+| total | 3 h 55 |
+
+**The tokens^1.9 law survives.** 24 005 → 74 000 tokens is ×3.08 for ×8.13 in time, an exponent of
+**1.86** — within noise of the 1.9 fitted between 9 k and 24 k. The law can be used across the
+whole range this port supports, which was not obvious: the 9 k→24 k fit sat in a regime where
+attention was 18–49 % of a block, and one could reasonably expect the exponent to climb toward 2
+once attention dominates. It does not, measurably.
+
+**Memory does not move with sequence length.** 34.5 GB at 74 k tokens against 34.4 GB at 9 k. The
+packed-sequence activations are negligible beside the 18.5 GB of qint8 weights, and the fused
+attention never materializes its score matrix — otherwise 74 000² would have ended the run. The
+practical consequence: **canvas and duration are bounded by time, not by RAM**, on a 96 GB machine.
+
+**Projection sanity check.** The same run without the LoRA (19 evaluations instead of 4) would be
+19 × 54 min 21 ≈ **17 h 30**, not the 29 h an earlier eyeballed estimate suggested — that figure
+came from misreading progress output as ~90 min per evaluation and never survived contact with the
+profiler's step statistics. Read `Average` from the step table; do not infer per-step cost from how
+long a progress line has been on screen.
