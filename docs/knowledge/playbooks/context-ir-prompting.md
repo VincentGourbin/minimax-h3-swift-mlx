@@ -71,9 +71,15 @@ exactly the failure the `--enhance-prompt` keyframe path was fixed to prevent.
 an abstract descriptor to keep out of prompts. Every published example in this repo opens with it
 ("Cinematic, medium side profile shot, …"), and `ContextIREnhancer.systemPrompt` instructs Gemma to
 open `[Shot 1]` with a style word, offering "Cinematic" first. Those runs came out well, so this is
-not a bug — but it is an untested habit contradicting the model author's guidance, and the honest
-resolution is a same-seed A/B (identical prompt with and without the opening descriptor) rather
-than editing the enhancer on authority. Until that runs, treat the style opener as unvalidated.
+not a bug — but it is an untested habit contradicting the model author's guidance.
+
+**Resolved 2026-08-20, and not by an A/B.** MiniMax's own reproducible 768p case
+(`scripts/readme/reproducible-768p-t2va-request.sh` in the HF repo) opens with *"[Shot 1]
+Cinematic, medium wide shot, pushing in slowly"* — the reference prompt the authors ship to
+demonstrate the model contradicts the avoid-list in their own skill. So the descriptor is not
+disqualifying; read the skill's rule as "do not let abstract adjectives replace concrete
+description", which the official prompt also honours (it spends 1 500 characters on consoles,
+insignias, thruster colour and camera moves). Keep the style opener, keep the specificity.
 
 **For whoever picks up Ref2VA** (out of scope today): it takes six sections in this order —
 `subject_definitions`, `summary`, `retention_analysis`, `detailed_description`, `overall_soundscape`,
