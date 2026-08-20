@@ -215,3 +215,14 @@ with the evidence, and the knowledge log carries what was learned.
   to EPERM while mounted (remount fixes it).
 - GPU state moves short benchmarks by 10×; anything timed follows
   [gpu-burst-vs-sustained](../pitfalls/gpu-burst-vs-sustained.md) or is not a number.
+
+## State at handoff (2026-08-20)
+
+- `transformer_ref/*` download RESUMED after filling the SSD at 35/61.7 GB — check
+  `.local-runs/transformer-ref-download.log` and `du -sh` the directory before Phase C.
+- To make room, the merged bf16 Turbo shard directories (`MiniMax-H3-turbo4/transformer`,
+  `MiniMax-H3-turbo8/transformer`, 62 GB each) were DELETED. Their qint8 prequantized exports
+  remain, so `generate --models-dir …turbo4|8` still works. To re-export at another quantization,
+  re-run `merge-lora` first (~3 min; the LoRA files live in `.local-runs/loras/`).
+- Phases A and B need no checkpoint beyond what is already on the SSD; only Phase C waits on the
+  download.
