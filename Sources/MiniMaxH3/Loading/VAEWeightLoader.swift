@@ -65,13 +65,25 @@ extension H3WeightLoader {
 
     // MARK: - Audio VAE (decode path)
 
-    public static func loadAudioVAE(modelDirectory: URL) throws -> H3AudioVAE {
+    /// - Parameter includeEncoder: ref2va conditions on reference soundtracks; every other path
+    ///   only decodes. The whole file is 0.6 GB, so the two halves are cheap either way — the flag
+    ///   is here to keep `apply`'s strict key matching honest, not to save memory.
+    public static func loadAudioVAE(
+        modelDirectory: URL, includeEncoder: Bool = false, includeDecoder: Bool = true
+    ) throws -> H3AudioVAE {
         let directory = modelDirectory.appendingPathComponent("audio_vae")
         let config = try H3AudioVAEConfig.load(from: directory.appendingPathComponent("config.json"))
-        let model = H3AudioVAE(config: config)
+        let model = H3AudioVAE(
+            config: config, includeEncoder: includeEncoder, includeDecoder: includeDecoder)
 
         let raw = try loadShardedWeights(directory: directory) { key in
-            (key.hasPrefix("decoder.") || key.hasPrefix("dec_in_proj.")) ? key : nil
+            let isDecoderKey = key.hasPrefix("decoder.") || key.hasPrefix("dec_in_proj.")
+            let isEncoderKey = key.hasPrefix("encoder.") || key.hasPrefix("pre_block.")
+                || key.hasPrefix("mean_proj.") || key.hasPrefix("logs_proj.")
+            guard (includeDecoder && isDecoderKey) || (includeEncoder && isEncoderKey) else {
+                return nil
+            }
+            return key
         }
 
         var weights = [String: MLXArray]()

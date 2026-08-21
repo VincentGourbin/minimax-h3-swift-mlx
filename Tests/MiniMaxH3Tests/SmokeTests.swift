@@ -104,4 +104,40 @@ struct CheckpointSmokeTests {
         #expect(presentation.tokenTags.count == presentation.tokenIds.count)
         #expect(presentation.mmTokenTypes.count == presentation.tokenIds.count)
     }
+
+    /// The ref2va presentation against the real tokenizer: labels numbered per modality in
+    /// request order, `"<Audio j>: "` emitted BEFORE `"<Video k>: "` for a soundtrack-bearing
+    /// video, one vision run per merged frame pair, and an mrope layout that covers the sequence.
+    @Test func ref2vaPresentationLabelsAndRuns() async throws {
+        let tokenizer = try await AutoTokenizer.from(
+            modelFolder: directory.appendingPathComponent("tokenizer"))
+        let presentation = try H3Presentation.ref2va(
+            prompt: "subject_definitions:\n<Subject 1> is the room in <Picture 1>.",
+            references: [
+                .audio,
+                .videoWithAudio(gridH: 8, gridW: 16, blockTimestamps: [0.25, 1.25]),
+                .image(gridH: 16, gridW: 16),
+            ],
+            tokenizer: tokenizer)
+
+        // Decoding without the pads shows the label structure the reference emits.
+        let imagePad = try #require(tokenizer.convertTokenToId("<|image_pad|>"))
+        let videoPad = try #require(tokenizer.convertTokenToId("<|video_pad|>"))
+        let structural = presentation.tokenIds
+            .filter { $0 != Int32(imagePad) && $0 != Int32(videoPad) }
+            .map(Int.init)
+        let decoded = tokenizer.decode(tokens: structural)
+        #expect(decoded.hasPrefix("<Audio 1>: <Audio 2>: <Video 1>: <0.2 seconds>"))
+        #expect(decoded.contains("<1.2 seconds>"))
+        #expect(decoded.contains("<Picture 1>: "))
+
+        // Three vision runs: two video blocks then the image.
+        let layout = try #require(try presentation.multimodalLayout())
+        #expect(layout.imageRuns.map(\.count) == [4 * 8, 4 * 8, 8 * 8])
+        #expect(layout.positions.dim(1) == presentation.tokenIds.count)
+        #expect(presentation.tokenTags.count == presentation.tokenIds.count)
+        // A vision block's rows are tagged as VIDEO for H3's AdaLN, delimiters included, while the
+        // mrope types mark only the pads (1 image, 2 video).
+        #expect(Set(presentation.mmTokenTypes) == [0, 1, 2])
+    }
 }

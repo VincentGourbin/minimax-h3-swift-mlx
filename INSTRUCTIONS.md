@@ -8,12 +8,16 @@ Python files are listed per component below.
 
 Omni-modal generative system: **video + synchronized stereo audio, jointly denoised** in a single packed
 sequence by one 33B dense transformer. 24 fps, 5–15 s, short edge 768 px, audio 32 kHz stereo.
-Two checkpoint partitions: `transformer/` serves `t2va` + `fl2va` (our targets), `transformer_ref/` serves
-`ref2va` (out of scope initially). All other components are shared.
+Two checkpoint partitions: `transformer/` serves `t2va` + `fl2va`, `transformer_ref/` serves `ref2va`
+(ported 2026-08-20; its `config.json` is byte-identical to the main one, so the loader, the quantization
+filter and the prequantized export all apply unchanged — only the directory name differs). All other
+components are shared.
 
 **Milestone 1 (this port's first goal): `t2va` full precision bf16**, reproducing
 `scripts/readme/reproducible-768p-t2va-request.sh` qualitatively. Then quantization (on-the-fly + prequantized
-export), then `fl2va` (needs Qwen3-VL vision tower + video VAE encoder).
+export), then `fl2va` (needs Qwen3-VL vision tower + video VAE encoder), then `ref2va` (needs the audio VAE
+*encoder*, Qwen3-VL's video processor and the per-reference rotary layout — see
+`docs/knowledge/playbooks/ref2va-port-plan.md`).
 
 ## Hardware envelope (M3 Max, 96 GB)
 

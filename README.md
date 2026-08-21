@@ -95,8 +95,26 @@ divergence, not visual quality). **Recommended default: prequantized qint8 for b
 Full methodology and numbers: [docs/knowledge/benchmarks/quantization-2026-08.md](docs/knowledge/benchmarks/quantization-2026-08.md);
 the prequantized export/load round-trip is validated bit-exact for every mode family.
 
+**ref2va** (references -> video+audio) landed 2026-08-21 against the `transformer_ref` partition,
+validated end to end by human review — subject identity carried from an image reference while the
+prompt drove the scene, voice timbre carried from an audio reference, and **lip sync holding**,
+which is what says the shared audio/video rotary clock lines a reference's blocks up with the
+generated rows. Covers:
+reference ingestion and normalization, the audio VAE *encoder*, Qwen3-VL's video processor, the
+per-reference rotary layout, the six-section prompt variant and the CLI. Every component is parity-
+checked against the diffusers reference (three of the five normalization contracts **bit-exact**;
+the audio encoder at 9e-5 on a 4.5 scale; the text stack at cosine 0.99977). One number to read
+correctly: the full-depth conditioner probe sits at cosine 0.911 in bf16 where fl2va reaches
+0.9997, and the clip is good anyway — the gap is irreducible bf16 rounding in the vision tower
+amplified ~10x by the model's massive activations, not a defect. The conditioner cosine does not
+transport as a quality metric between modes; see
+[the investigation](docs/knowledge/investigations/ref2va-conditioner-bf16-2026-08.md). Be
+aware of what a *video* reference costs: it is encoded on its own 768-short-edge canvas whatever
+the target canvas is, so the official 768p case packs ~82 000 rows against a t2va run's ~38 000 —
+multi-day on an M3 Max. Image and audio references are far cheaper.
+
 **Not yet:**
-- ref2va, and the hosted-only H3-Context-IR / H3-Regenerate-2K stages
+- the hosted-only H3-Context-IR / H3-Regenerate-2K stages
 - MiniMax's sparse attention for H3 (still unpublished — their [MSA](https://github.com/MiniMax-AI/MSA)
   release is SM100 CUDA kernels, so only the algorithm transfers here) — the real unlock for
   full 768p speed
@@ -156,6 +174,17 @@ minimax-h3 generate "The car lifts off and flies above the trees" --image car.jp
 # ...and/or an ending keyframe (alone: generate *up to* it; with --image: interpolate between)
 minimax-h3 generate "..." --image first.jpg --last-image last.jpg -o morph.mp4
 
+# References -> video+audio (ref2va): an ordered list of images, videos (their soundtrack comes
+# along) and audio clips, conditioned on together. THE ORDER IS THE REQUEST — it numbers the
+# <Picture i>/<Audio j>/<Video k> labels the prompt refers to AND lays the blocks out on the
+# shared audio/video rotary clock, so a reordered list is a different request. References never
+# bind the generated geometry: the canvas stays H3's own 16:9 unless -W/-H say otherwise.
+# Runs against the `transformer_ref` partition (a second 61.7 GB download).
+minimax-h3 generate "$(cat prompt.txt)" \
+  --reference subject.png --reference motion.mp4 --reference voice.wav -o ref.mp4
+# Limits, enforced with errors: <=9 images, <=3 videos, <=3 audios, <=12 total, and an audio
+# reference is never allowed on its own.
+
 # Smaller canvas = much faster per step (multiples of 32). Short edge 768 is the trained
 # regime; smaller trades quality (and ~6 dB of audio level) for speed.
 minimax-h3 generate "..." -W 960 -H 544 -s 30 -o fast.mp4 --profile
@@ -173,6 +202,10 @@ minimax-h3 enhance "un renard trotte dans la neige" -f 124
 minimax-h3 enhance "il repart entre les sapins" --image frame.png          # I2VA, image-anchored
 minimax-h3 enhance "même ambiance sonore" --audio clip.wav                 # soundscape transfer
 minimax-h3 enhance "même scène au coucher du soleil" --video ref.mp4       # structural reference
+# Ref2VA takes six sections of its own (subject_definitions, summary, retention_analysis,
+# detailed_description, overall_soundscape, non_diegetic_music). Pass the SAME reference list, in
+# the SAME order, as the generate call — that is what makes the labels resolve.
+minimax-h3 enhance "elle répond en riant" --reference subject.png --reference voice.wav
 minimax-h3 generate "un renard trotte dans la neige" --enhance-prompt -o fox.mp4
 
 # Rebuild an MP4 from a saved raw result (written automatically before every mux)
@@ -183,6 +216,16 @@ minimax-h3 mux fox.raw.safetensors -o fox2.mp4 --normalize-audio
 minimax-h3 merge-lora --lora minimax_h3_fl2v_turbo_8step_v1.0_bf16.safetensors \
   --models-dir "$H3_MODELS_DIR" --out "$H3_MODELS_DIR/../MiniMax-H3-turbo8"
 minimax-h3 export-quantized transformer --quant qint8 --models-dir .../MiniMax-H3-turbo8
+# (`export-quantized transformer-ref` does the same for the ref2va partition; `all` does not
+# sweep it up — it is a second 61.7 GB read and a second ~18.5 GB export.)
+# ref2va has its own adapter, and only at 4 steps: `minimax_h3_ref2v_turbo_4step_v0.1_bf16`.
+# Its 312 target modules all resolve against `transformer_ref` and its metadata alpha of 8 is
+# handled, so it folds unchanged — but the fl2v 4-step adapter failed on speech intelligibility
+# and no 8-step ref2v sibling exists, so treat it as UNVALIDATED until someone listens to a
+# dialogue clip made with it.
+minimax-h3 merge-lora --component transformer_ref \
+  --lora minimax_h3_ref2v_turbo_4step_v0.1_bf16.safetensors \
+  --models-dir "$H3_MODELS_DIR" --out "$H3_MODELS_DIR/../MiniMax-H3-ref-turbo4"
 minimax-h3 generate "..." --models-dir .../MiniMax-H3-turbo8 -s 9 -o fast.mp4
 
 # Performance work — none of these need the checkpoint, they run on synthetic weights

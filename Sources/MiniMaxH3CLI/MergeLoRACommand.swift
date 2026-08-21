@@ -31,6 +31,13 @@ struct MergeLoRACommand: AsyncParsableCommand {
     @Option(name: .long, help: "Multiplier on the folded delta (sharpness dial; 1.0 = as published).")
     var strength: Double = 1.0
 
+    @Option(
+        name: .long,
+        help: ArgumentHelp(
+            "Which transformer partition to fold into: transformer (t2va/fl2va) or "
+                + "transformer_ref (ref2va). The published `ref2v` adapters target the latter."))
+    var component: String = "transformer"
+
     @Option(name: .long, help: "Model directory (diffusers layout).")
     var modelsDir: String = defaultModelsDirectory()
 
@@ -41,10 +48,16 @@ struct MergeLoRACommand: AsyncParsableCommand {
     /// transformer exported from the ORIGINAL weights, and the loader prefers it over the shards —
     /// linking it here would make every run silently load un-adapted weights at the Turbo step
     /// count, which looks like a quality collapse rather than a wiring mistake.
-    private static let siblings = [
+    private static let baseSiblings = [
         "text_encoder", "vae", "audio_vae", "tokenizer", "processor", "scheduler",
         "audio_scheduler",
     ]
+
+    /// The partition this run is NOT folding into travels along too, so `--models-dir <out>` stays
+    /// a drop-in for every mode rather than only the adapted one.
+    private var siblings: [String] {
+        Self.baseSiblings + [component == "transformer" ? "transformer_ref" : "transformer"]
+    }
 
     func run() async throws {
         H3Debug.isEnabled = true
@@ -55,8 +68,11 @@ struct MergeLoRACommand: AsyncParsableCommand {
             throw ValidationError("no LoRA file at \(loraURL.path)")
         }
 
-        let sourceTransformer = source.appendingPathComponent("transformer")
-        let destinationTransformer = destination.appendingPathComponent("transformer")
+        guard component == "transformer" || component == "transformer_ref" else {
+            throw ValidationError("--component must be `transformer` or `transformer_ref`.")
+        }
+        let sourceTransformer = source.appendingPathComponent(component)
+        let destinationTransformer = destination.appendingPathComponent(component)
         try FileManager.default.createDirectory(
             at: destinationTransformer, withIntermediateDirectories: true)
 
@@ -70,7 +86,7 @@ struct MergeLoRACommand: AsyncParsableCommand {
         // directory: `FileManager.contentsOfDirectory` refuses a symlink-to-directory, which is how
         // the first merged checkpoint denoised all four steps and then died on "the file 'vae'
         // couldn't be opened" — after the expensive part was already done.
-        for sibling in Self.siblings {
+        for sibling in siblings {
             let target = source.appendingPathComponent(sibling)
             guard let files = try? FileManager.default.contentsOfDirectory(
                 at: target, includingPropertiesForKeys: nil) else { continue }
@@ -95,7 +111,7 @@ struct MergeLoRACommand: AsyncParsableCommand {
                 try FileManager.default.createDirectory(at: mirror, withIntermediateDirectories: true)
                 let files = (try? FileManager.default.contentsOfDirectory(
                     at: quantDirectory, includingPropertiesForKeys: nil)) ?? []
-                for file in files where file.lastPathComponent != "transformer.safetensors" {
+                for file in files where file.lastPathComponent != "\(component).safetensors" {
                     let link = mirror.appendingPathComponent(file.lastPathComponent)
                     try? FileManager.default.removeItem(at: link)
                     try FileManager.default.createSymbolicLink(at: link, withDestinationURL: file)
@@ -134,7 +150,7 @@ struct MergeLoRACommand: AsyncParsableCommand {
         }
         print(String(
             format: "Folded %d tensors in %.0f s. Use it with:\n"
-                + "  minimax-h3 export-quantized transformer --models-dir %@\n"
+                + "  minimax-h3 export-quantized \(component == "transformer_ref" ? "transformer-ref" : "transformer") --models-dir %@\n"
                 + "  minimax-h3 generate \"…\" --models-dir %@ -s 5",
             total, Date().timeIntervalSince(start), destination.path, destination.path))
     }

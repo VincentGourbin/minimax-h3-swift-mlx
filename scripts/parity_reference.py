@@ -505,9 +505,587 @@ def dump_conditioner_fl2va(models_dir: pathlib.Path) -> None:
     )
 
 
+def dump_ref_normalize(models_dir: pathlib.Path) -> None:
+    """ref2va reference normalization: the frame-rate resample, the canvas rescale, the
+    truncate-then-resample soundtrack contract, and the image reference's own 2048 short edge.
+
+    The two normalizers are called as `MiniMaxH3Ref2VASetupStep` static methods with the released
+    checkpoint's geometry passed explicitly, so the probe needs no pipeline and no weights. The
+    image branch is inlined the same way (`image_processor.resize` on a PIL image is exactly
+    `image.resize((width, height), LANCZOS)` — the `keyframe-preprocess` probe covers that
+    equivalence bit for bit).
+    """
+    import numpy as np
+    from PIL import Image
+
+    from diffusers.modular_pipelines.minimax_h3.before_encoder import MiniMaxH3Ref2VASetupStep
+
+    normalize_video = MiniMaxH3Ref2VASetupStep._normalize_video_condition
+    normalize_audio = MiniMaxH3Ref2VASetupStep._normalize_audio_condition
+    multiple, short_edge, max_pixels = 32, 768, 768 * 1344
+    num_frames = 124  # 17 * 7 + 5, the 5 s canonical count
+    max_duration = num_frames / 24
+
+    rng = np.random.default_rng(1201)
+
+    # 1. A video reference at an odd rate and an odd shape: both passes run.
+    #    10 frames at 30 fps -> floor(10 * 0.8 + 0.5) = 8 slots; 175x99 resolves to 1344x768.
+    source_frames = rng.integers(0, 256, (10, 99, 175, 3), dtype=np.uint8)
+    video = normalize_video(source_frames, 30.0, num_frames, multiple, short_edge, max_pixels, 24.0)
+
+    # 2. A video already at 24 fps and already on its canvas: the parity-exact pass-through.
+    passthrough_source = rng.integers(0, 256, (2, 768, 1344, 3), dtype=np.uint8)
+    passthrough = normalize_video(
+        passthrough_source, 24.0, num_frames, multiple, short_edge, max_pixels, 24.0
+    )
+
+    # 3. A stereo soundtrack at 44.1 kHz, longer than the generated duration: truncated at the
+    #    NATIVE rate, then resampled once.
+    clock = np.arange(44100 * 8) / 44100
+    soundtrack_source = np.stack(
+        [np.sin(2 * np.pi * 440 * clock), 0.5 * np.sin(2 * np.pi * 997 * clock)]
+    ).astype(np.float32)
+    soundtrack = normalize_audio(torch.from_numpy(soundtrack_source), 44100, 32000, max_duration)
+
+    # 4. A mono audio reference at 16 kHz: upmixed by channel repeat, then upsampled.
+    clock = np.arange(16000 * 2) / 16000
+    mono_source = np.stack([np.sin(2 * np.pi * 220 * clock)]).astype(np.float32)
+    mono = normalize_audio(torch.from_numpy(mono_source), 16000, 32000, max_duration)
+
+    # 5. An image reference: short edge to 2048, upscaling included, no area cap.
+    image_source = rng.integers(0, 256, (700, 1000, 3), dtype=np.uint8)
+    pil = Image.fromarray(image_source, mode="RGB")
+    width, height = pil.size
+    scale = 2048 / min(width, height)
+    target_height = max(multiple, round(height * scale / multiple) * multiple)
+    target_width = max(multiple, round(width * scale / multiple) * multiple)
+    picture = pil.resize((target_width, target_height), Image.Resampling.LANCZOS)
+
+    save_file(
+        {
+            "video_source": torch.from_numpy(source_frames),
+            "video": torch.from_numpy(np.ascontiguousarray(video)),
+            "passthrough_source": torch.from_numpy(passthrough_source),
+            # `.clone()`: an already-normalized video is returned as a *view* of the source,
+            # which is the pass-through contract itself and which safetensors refuses to share.
+            "passthrough": torch.from_numpy(np.ascontiguousarray(passthrough)).clone(),
+            "soundtrack_source": torch.from_numpy(soundtrack_source),
+            "soundtrack": soundtrack.contiguous(),
+            "mono_source": torch.from_numpy(mono_source),
+            "mono": mono.contiguous(),
+            "image_source": torch.from_numpy(image_source),
+            "image": torch.from_numpy(np.asarray(picture)),
+        },
+        out_dir(models_dir) / "ref_normalize.safetensors",
+    )
+    print(
+        "ref-normalize: video", video.shape, "passthrough", passthrough.shape,
+        "soundtrack", tuple(soundtrack.shape), "mono", tuple(mono.shape),
+        "image", picture.size,
+    )
+
+
+def dump_audio_vae_encode(models_dir: pathlib.Path) -> None:
+    """The DAC trunk + causal-attention `pre_block` + `mean_proj`, i.e. what ref2va encodes a
+    reference soundtrack with. Stereo is two batch items of the mono VAE; MiniMax-H3 takes the
+    posterior *mean* and never samples, so `mean` is the tensor that matters."""
+    from diffusers import AutoencoderKLMiniMaxH3Audio
+
+    vae = AutoencoderKLMiniMaxH3Audio.from_pretrained(models_dir, subfolder="audio_vae")
+    vae.eval()
+    torch.manual_seed(77)
+    # 64 latents' worth of samples, plus 137 to exercise the right-pad to the 800-sample hop.
+    waveform = 0.3 * torch.randn(2, 1, 800 * 64 + 137, dtype=torch.float32)
+    with torch.no_grad():
+        posterior = vae.encode(waveform, return_dict=False)[0]
+    save_file(
+        {
+            "waveform": waveform.squeeze(1).contiguous(),
+            "mean": posterior.mean.contiguous(),
+            "logs": posterior.logs.contiguous(),
+        },
+        out_dir(models_dir) / "audio_vae_encode.safetensors",
+    )
+    print(
+        "audio-vae-encode:", tuple(posterior.mean.shape),
+        "rms", posterior.mean.pow(2).mean().sqrt().item(),
+    )
+
+
+def dump_video_condition(models_dir: pathlib.Path) -> None:
+    """A ref2va video reference through Qwen3-VL's *video* processor and the vision tower.
+
+    Two things are being pinned. First the processor: `smart_resize` over the whole clip's
+    `t * h * w` budget, the tail padded to the temporal patch, and the block-major patchify whose
+    two temporal slots hold two *different* frames. Second, and the reason the Swift port can run
+    the tower once per merged frame pair instead of once per clip: Qwen3-VL's vision attention is
+    segmented per temporal group (`cu_seqlens` splits on T) and its rotary table carries no
+    temporal component, so a `grid_t = N` call must equal N independent `grid_t = 1` calls. The
+    dump carries both so the Swift side can check the equality it relies on.
+    """
+    import json
+
+    import numpy as np
+    from safetensors import safe_open
+
+    text_dir = models_dir / "text_encoder"
+    index = json.loads((text_dir / "model.safetensors.index.json").read_text())["weight_map"]
+    wanted = {k: s for k, s in index.items() if k.startswith("model.visual.")}
+    weights = {}
+    for shard in sorted(set(wanted.values())):
+        with safe_open(text_dir / shard, framework="pt") as handle:
+            for key in handle.keys():
+                if key in wanted:
+                    weights[key] = handle.get_tensor(key)
+
+    from transformers import AutoConfig, AutoProcessor
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionModel
+
+    config = AutoConfig.from_pretrained(models_dir, subfolder="text_encoder")
+    visual = Qwen3VLVisionModel(config.vision_config)
+    visual.load_state_dict({k[len("model.visual."):]: v for k, v in weights.items()})
+    visual = visual.eval().to(torch.float32)
+
+    from diffusers.modular_pipelines.minimax_h3.encoders import MiniMaxH3Ref2VATextEncoderStep
+
+    processor = AutoProcessor.from_pretrained(models_dir, subfolder="processor")
+    temporal_patch = processor.video_processor.temporal_patch_size
+    rng = np.random.default_rng(4242)
+    # 5 frames of a 96x160 clip: 3 sampled at 2 fps from a 24 fps stream needs 25 frames, so the
+    # sampling is exercised on a stream long enough to produce an odd count (tail padding).
+    frames = rng.integers(0, 255, (25, 96, 160, 3), dtype=np.uint8)
+    sampled, timestamps = MiniMaxH3Ref2VATextEncoderStep._sample_video_condition_frames(
+        frames, 24.0, 2.0, temporal_patch
+    )
+    batch = processor.video_processor(
+        videos=[np.stack(sampled)], do_sample_frames=False, return_tensors="pt"
+    )
+    pixel_values = batch["pixel_values_videos"].to(torch.float32)
+    grid_thw = batch["video_grid_thw"]
+    grid_t, grid_h, grid_w = (int(value) for value in grid_thw[0])
+    with torch.no_grad():
+        whole = visual(pixel_values, grid_thw)
+        per_group = [
+            visual(
+                pixel_values[group * grid_h * grid_w : (group + 1) * grid_h * grid_w],
+                torch.tensor([[1, grid_h, grid_w]]),
+            )
+            for group in range(grid_t)
+        ]
+    grouped = torch.cat([out.pooler_output for out in per_group])
+    save_file(
+        {
+            "frames": torch.from_numpy(frames),
+            "sampled_indices": torch.tensor([int(i) for i in range(len(sampled))]),
+            "timestamps": torch.tensor(timestamps, dtype=torch.float32),
+            "pixel_values": pixel_values.contiguous(),
+            "grid_thw": grid_thw,
+            "embeds": whole.pooler_output.float().contiguous(),
+            "embeds_per_group": grouped.float().contiguous(),
+            "deepstack_0": whole.deepstack_features[0].float().contiguous(),
+        },
+        out_dir(models_dir) / "video_condition.safetensors",
+    )
+    print(
+        "video-condition:", len(sampled), "sampled ->", grid_thw.tolist(),
+        "labels", [f"<{t:.1f} seconds>" for t in timestamps],
+        "| grid_t=N vs N x grid_t=1 max|d|",
+        (whole.pooler_output - grouped).abs().max().item(),
+    )
+
+
+def dump_conditioner_ref2va(models_dir: pathlib.Path) -> None:
+    """Full-depth ref2va conditioner: an audio reference, a video reference with its soundtrack and
+    an image reference, through the real setup + presentation steps and the text stack to
+    hidden_states[50], everything in the release's bf16.
+
+    HEAVY: loads 51 decoder layers (~53 GB) on CPU — run it alone.
+
+    The reference list is deliberately `[audio, video+sound, image]`: it puts an `"<Audio 1>: "`
+    label with no vision block first, then a soundtrack-bearing video whose own `"<Audio 2>: "`
+    label precedes its `"<Video 1>: "`, then an image — so the per-modality numbering, the
+    interleaving and the timestamped video blocks are all exercised in one pass.
+    """
+    import numpy as np
+    from PIL import Image
+
+    from transformers import AutoConfig, AutoProcessor, AutoTokenizer
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLModel
+
+    from diffusers.modular_pipelines.minimax_h3.before_encoder import MiniMaxH3Ref2VASetupStep
+    from diffusers.modular_pipelines.minimax_h3.encoders import MiniMaxH3Ref2VATextEncoderStep
+    from diffusers.modular_pipelines.minimax_h3.references import (
+        MiniMaxH3AudioReference,
+        MiniMaxH3ImageReference,
+        MiniMaxH3VideoReference,
+    )
+
+    prompt = (
+        "subject_definitions:\n<Subject 1> is the room in <Picture 1>.\n\n"
+        "summary:\n[reference generation + audio reference] A short handheld take in <Subject 1>."
+    )
+    num_frames = 124
+    multiple, short_edge, max_pixels = 32, 768, 768 * 1344
+    rng = np.random.default_rng(90210)
+
+    # A standalone audio reference: 1.5 s of mono 16 kHz.
+    clock = np.arange(int(1.5 * 16000)) / 16000
+    voice = np.stack([np.sin(2 * np.pi * 180 * clock) * 0.4]).astype(np.float32)
+    # A video reference with a soundtrack: 25 frames at 24 fps (3 sampled -> 2 blocks, odd count
+    # so the tail padding runs), 96x160, stereo 32 kHz sound.
+    clip = rng.integers(0, 255, (25, 96, 160, 3), dtype=np.uint8)
+    clip_clock = np.arange(32000) / 32000
+    clip_audio = np.stack(
+        [np.sin(2 * np.pi * 300 * clip_clock), np.sin(2 * np.pi * 700 * clip_clock)]
+    ).astype(np.float32) * 0.3
+    # An image reference, deliberately small: it is upscaled to its own 2048 short edge.
+    picture = rng.integers(0, 255, (120, 120, 3), dtype=np.uint8)
+
+    references = [
+        MiniMaxH3AudioReference(audio=torch.from_numpy(voice), sample_rate=16000),
+        MiniMaxH3VideoReference(
+            frames=clip, fps=24.0, audio=torch.from_numpy(clip_audio), sample_rate=32000
+        ),
+        MiniMaxH3ImageReference(image=Image.fromarray(picture, mode="RGB")),
+    ]
+
+    # Normalization, through the setup step's own arithmetic (the image branch inlined the same
+    # way `ref-normalize` inlines it).
+    normalize_audio = MiniMaxH3Ref2VASetupStep._normalize_audio_condition
+    max_duration = num_frames / 24
+    normalized = [
+        MiniMaxH3AudioReference(
+            audio=normalize_audio(torch.from_numpy(voice), 16000, 32000, max_duration),
+            sample_rate=32000,
+        ),
+        MiniMaxH3VideoReference(
+            frames=MiniMaxH3Ref2VASetupStep._normalize_video_condition(
+                clip, 24.0, num_frames, multiple, short_edge, max_pixels, 24.0
+            ),
+            fps=24.0,
+            audio=normalize_audio(torch.from_numpy(clip_audio), 32000, 32000, max_duration),
+            sample_rate=32000,
+        ),
+    ]
+    scale = 2048 / min(picture.shape[0], picture.shape[1])
+    target_h = max(multiple, round(picture.shape[0] * scale / multiple) * multiple)
+    target_w = max(multiple, round(picture.shape[1] * scale / multiple) * multiple)
+    normalized.append(
+        MiniMaxH3ImageReference(
+            image=Image.fromarray(picture, mode="RGB").resize(
+                (target_w, target_h), Image.Resampling.LANCZOS
+            )
+        )
+    )
+
+    processor = AutoProcessor.from_pretrained(models_dir, subfolder="processor")
+    tokenizer = AutoTokenizer.from_pretrained(models_dir, subfolder="tokenizer")
+    step = MiniMaxH3Ref2VATextEncoderStep()
+    vision_inputs, image_counts, video_counts, video_timestamps = step._gather_vision_features(
+        processor, normalized, 24.0
+    )
+    token_ids, token_tags = step._build_presentation(
+        tokenizer, prompt, normalized, image_counts, video_counts, video_timestamps
+    )
+    input_ids = torch.tensor([token_ids])
+    mm_token_type_ids = torch.tensor(processor.create_mm_token_type_ids([token_ids]))
+
+    config = AutoConfig.from_pretrained(models_dir, subfolder="text_encoder")
+    config.text_config.num_hidden_layers = 51
+    model = Qwen3VLModel.from_pretrained(
+        models_dir, subfolder="text_encoder", config=config, dtype=torch.bfloat16
+    ).eval()
+    vision_kwargs = {
+        name: (value.to(torch.bfloat16) if name.startswith("pixel_") else value)
+        for name, value in vision_inputs.items()
+    }
+    with torch.no_grad():
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=torch.ones_like(input_ids),
+            mm_token_type_ids=mm_token_type_ids,
+            use_cache=False,
+            output_hidden_states=True,
+            **vision_kwargs,
+        )
+    hidden = outputs.hidden_states[50]
+    tensors = {
+        "voice": torch.from_numpy(voice),
+        "clip": torch.from_numpy(clip),
+        "clip_audio": torch.from_numpy(clip_audio),
+        "picture": torch.from_numpy(picture),
+        "token_ids": input_ids,
+        "token_tags": torch.tensor([token_tags]),
+        "mm_token_type_ids": mm_token_type_ids,
+        "image_grid_thw": vision_inputs["image_grid_thw"],
+        "video_grid_thw": vision_inputs["video_grid_thw"],
+        "hidden_50": hidden.float().contiguous(),
+    }
+    for depth in (1, 2, 5, 10, 20, 30, 40, 45, 49):
+        tensors[f"hidden_{depth}"] = outputs.hidden_states[depth].float().contiguous()
+    save_file(tensors, out_dir(models_dir) / "conditioner_ref2va.safetensors")
+    print(
+        "conditioner-ref2va:", len(token_ids), "tokens,", tuple(hidden.shape),
+        "rms", hidden.float().pow(2).mean().sqrt().item(),
+        "| labels", [f"<{t:.1f} seconds>" for t in video_timestamps[0]],
+    )
+
+
+def dump_vision_tower_large(models_dir: pathlib.Path) -> None:
+    """The vision tower at a ref2va IMAGE reference's geometry: a 2048-short-edge image, i.e. a
+    128x128 patch grid and 16 384 tokens in ONE tower call.
+
+    Every earlier tower probe ran at a few hundred patches (a 768-canvas keyframe is 16x28). A
+    reference image is two orders of magnitude larger, which puts the learned 48x48 position table
+    through a much wider interpolation and the tower's attention through a sequence it has never
+    been checked at here. fp32 on both sides, like the other isolation probes.
+    """
+    import json
+
+    import numpy as np
+    from safetensors import safe_open
+
+    text_dir = models_dir / "text_encoder"
+    index = json.loads((text_dir / "model.safetensors.index.json").read_text())["weight_map"]
+    wanted = {k: s for k, s in index.items() if k.startswith("model.visual.")}
+    weights = {}
+    for shard in sorted(set(wanted.values())):
+        with safe_open(text_dir / shard, framework="pt") as handle:
+            for key in handle.keys():
+                if key in wanted:
+                    weights[key] = handle.get_tensor(key)
+
+    from transformers import AutoConfig, AutoProcessor
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionModel
+
+    config = AutoConfig.from_pretrained(models_dir, subfolder="text_encoder")
+    visual = Qwen3VLVisionModel(config.vision_config)
+    visual.load_state_dict({k[len("model.visual."):]: v for k, v in weights.items()})
+    visual = visual.eval().to(torch.float32)
+
+    processor = AutoProcessor.from_pretrained(models_dir, subfolder="processor")
+    rng = np.random.default_rng(31337)
+    image = rng.integers(0, 255, (2048, 2048, 3), dtype=np.uint8)
+    batch = processor.image_processor(images=[image], return_tensors="pt")
+    pixel_values, grid_thw = batch["pixel_values"].to(torch.float32), batch["image_grid_thw"]
+    with torch.no_grad():
+        out = visual(pixel_values, grid_thw)
+    save_file(
+        {
+            "image": torch.from_numpy(image),
+            "grid_thw": grid_thw,
+            "embeds": out.pooler_output.float().contiguous(),
+            "deepstack_0": out.deepstack_features[0].float().contiguous(),
+            "deepstack_2": out.deepstack_features[2].float().contiguous(),
+        },
+        out_dir(models_dir) / "vision_tower_large.safetensors",
+    )
+    print("vision-tower-large:", grid_thw.tolist(), tuple(out.pooler_output.shape))
+
+
+def dump_ref2va_embeddings(models_dir: pathlib.Path) -> None:
+    """`hidden_states[0]` of the ref2va presentation: the token embeddings with the vision features
+    injected, and NOTHING else — no decoder layer runs.
+
+    This is the discriminator the full-depth probe cannot be: if the port and the reference agree
+    here, every later difference belongs to the text stack; if they disagree, the conditioning
+    going in is already wrong and the depth profile is downstream of that. Cheap because the stack
+    is truncated to a single layer — `hidden_states[0]` does not depend on how many follow.
+    """
+    import numpy as np
+    from PIL import Image
+
+    from transformers import AutoConfig, AutoProcessor, AutoTokenizer
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLModel
+
+    from diffusers.modular_pipelines.minimax_h3.before_encoder import MiniMaxH3Ref2VASetupStep
+    from diffusers.modular_pipelines.minimax_h3.encoders import MiniMaxH3Ref2VATextEncoderStep
+    from diffusers.modular_pipelines.minimax_h3.references import (
+        MiniMaxH3AudioReference,
+        MiniMaxH3ImageReference,
+        MiniMaxH3VideoReference,
+    )
+
+    # The same synthetic request as `conditioner-ref2va`, so the two probes are comparable.
+    prompt = (
+        "subject_definitions:\n<Subject 1> is the room in <Picture 1>.\n\n"
+        "summary:\n[reference generation + audio reference] A short handheld take in <Subject 1>."
+    )
+    num_frames, multiple, short_edge, max_pixels = 124, 32, 768 * 1, 768 * 1344
+    rng = np.random.default_rng(90210)
+    clock = np.arange(int(1.5 * 16000)) / 16000
+    voice = np.stack([np.sin(2 * np.pi * 180 * clock) * 0.4]).astype(np.float32)
+    clip = rng.integers(0, 255, (25, 96, 160, 3), dtype=np.uint8)
+    clip_clock = np.arange(32000) / 32000
+    clip_audio = np.stack(
+        [np.sin(2 * np.pi * 300 * clip_clock), np.sin(2 * np.pi * 700 * clip_clock)]
+    ).astype(np.float32) * 0.3
+    picture = rng.integers(0, 255, (120, 120, 3), dtype=np.uint8)
+
+    normalize_audio = MiniMaxH3Ref2VASetupStep._normalize_audio_condition
+    max_duration = num_frames / 24
+    normalized = [
+        MiniMaxH3AudioReference(
+            audio=normalize_audio(torch.from_numpy(voice), 16000, 32000, max_duration),
+            sample_rate=32000,
+        ),
+        MiniMaxH3VideoReference(
+            frames=MiniMaxH3Ref2VASetupStep._normalize_video_condition(
+                clip, 24.0, num_frames, multiple, short_edge, max_pixels, 24.0
+            ),
+            fps=24.0,
+            audio=normalize_audio(torch.from_numpy(clip_audio), 32000, 32000, max_duration),
+            sample_rate=32000,
+        ),
+    ]
+    scale = 2048 / min(picture.shape[0], picture.shape[1])
+    target_h = max(multiple, round(picture.shape[0] * scale / multiple) * multiple)
+    target_w = max(multiple, round(picture.shape[1] * scale / multiple) * multiple)
+    normalized.append(
+        MiniMaxH3ImageReference(
+            image=Image.fromarray(picture, mode="RGB").resize(
+                (target_w, target_h), Image.Resampling.LANCZOS
+            )
+        )
+    )
+
+    processor = AutoProcessor.from_pretrained(models_dir, subfolder="processor")
+    tokenizer = AutoTokenizer.from_pretrained(models_dir, subfolder="tokenizer")
+    step = MiniMaxH3Ref2VATextEncoderStep()
+    vision_inputs, image_counts, video_counts, video_timestamps = step._gather_vision_features(
+        processor, normalized, 24.0
+    )
+    token_ids, _ = step._build_presentation(
+        tokenizer, prompt, normalized, image_counts, video_counts, video_timestamps
+    )
+    input_ids = torch.tensor([token_ids])
+    mm_token_type_ids = torch.tensor(processor.create_mm_token_type_ids([token_ids]))
+
+    config = AutoConfig.from_pretrained(models_dir, subfolder="text_encoder")
+    config.text_config.num_hidden_layers = 1  # hidden_states[0] does not depend on the rest
+    model = Qwen3VLModel.from_pretrained(
+        models_dir, subfolder="text_encoder", config=config, dtype=torch.bfloat16
+    ).eval()
+    vision_kwargs = {
+        name: (value.to(torch.bfloat16) if name.startswith("pixel_") else value)
+        for name, value in vision_inputs.items()
+    }
+    with torch.no_grad():
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=torch.ones_like(input_ids),
+            mm_token_type_ids=mm_token_type_ids,
+            use_cache=False,
+            output_hidden_states=True,
+            **vision_kwargs,
+        )
+    embedded = outputs.hidden_states[0]
+    # The vision features on their own too, so a mismatch can be blamed on the tower or on the
+    # injection rather than on "somewhere in between".
+    with torch.no_grad():
+        image_features = model.get_image_features(
+            vision_kwargs["pixel_values"], vision_kwargs["image_grid_thw"]
+        )
+        video_features = model.get_video_features(
+            vision_kwargs["pixel_values_videos"], vision_kwargs["video_grid_thw"]
+        )
+
+    # The same pixels through a standalone fp32 tower, so the four corners of the comparison
+    # exist: ours/theirs x bf16/fp32. Two bf16 implementations of a 27-layer tower always diverge;
+    # what matters is whether OURS is further from the fp32 truth than THEIRS is.
+    import json as _json
+
+    from safetensors import safe_open as _safe_open
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionModel
+
+    _index = _json.loads(
+        (models_dir / "text_encoder" / "model.safetensors.index.json").read_text()
+    )["weight_map"]
+    _wanted = {k: v for k, v in _index.items() if k.startswith("model.visual.")}
+    _weights = {}
+    for _shard in sorted(set(_wanted.values())):
+        with _safe_open(models_dir / "text_encoder" / _shard, framework="pt") as _handle:
+            for _key in _handle.keys():
+                if _key in _wanted:
+                    _weights[_key] = _handle.get_tensor(_key)
+    _visual = Qwen3VLVisionModel(config.vision_config)
+    _visual.load_state_dict({k[len("model.visual."):]: v for k, v in _weights.items()})
+    _visual = _visual.eval().to(torch.float32)
+    with torch.no_grad():
+        image_features_fp32 = _visual(
+            vision_inputs["pixel_values"].to(torch.float32), vision_inputs["image_grid_thw"]
+        ).pooler_output
+        video_features_fp32 = _visual(
+            vision_inputs["pixel_values_videos"].to(torch.float32),
+            vision_inputs["video_grid_thw"],
+        ).pooler_output
+
+    def first(features):
+        """The merged vision tokens, whatever wrapper this transformers version returns.
+
+        `get_image_features` has returned a bare tensor, a `ModelOutput` and a tuple of them
+        across versions, so unwrap until a tensor falls out rather than assume any one shape.
+        """
+        seen = type(features).__name__
+        for _ in range(4):
+            if isinstance(features, torch.Tensor):
+                return features
+            for attribute in ("pooler_output", "last_hidden_state"):
+                if hasattr(features, attribute):
+                    features = getattr(features, attribute)
+                    break
+            else:
+                if isinstance(features, (list, tuple)) and features:
+                    features = features[0]
+                else:
+                    break
+        raise TypeError(f"cannot find the vision tokens in a {seen}: got {type(features).__name__}")
+
+    save_file(
+        {
+            # The media too, so the Swift side rebuilds the same request from this one file.
+            "voice": torch.from_numpy(voice),
+            "clip": torch.from_numpy(clip),
+            "clip_audio": torch.from_numpy(clip_audio),
+            "picture": torch.from_numpy(picture),
+            "token_ids": input_ids,
+            "mm_token_type_ids": mm_token_type_ids,
+            "image_grid_thw": vision_inputs["image_grid_thw"],
+            "video_grid_thw": vision_inputs["video_grid_thw"],
+            "hidden_0": embedded.float().contiguous(),
+            "image_features": first(image_features).float().contiguous(),
+            "video_features": first(video_features).float().contiguous(),
+            "image_features_fp32": image_features_fp32.float().contiguous(),
+            "video_features_fp32": video_features_fp32.float().contiguous(),
+            # The deepstack taps of the SAME bf16 call, so a replay can drive the text stack
+            # entirely from the reference's own vision side and leave nothing of ours in it.
+            **{
+                f"image_deepstack_{level}": tap.float().contiguous()
+                for level, tap in enumerate(image_features.deepstack_features)
+            },
+            **{
+                f"video_deepstack_{level}": tap.float().contiguous()
+                for level, tap in enumerate(video_features.deepstack_features)
+            },
+        },
+        out_dir(models_dir) / "ref2va_embeddings.safetensors",
+    )
+    print(
+        "  reference tower, its own bf16 vs fp32: image max|d|",
+        (first(image_features).float() - image_features_fp32.float()).abs().max().item(),
+        " video max|d|",
+        (first(video_features).float() - video_features_fp32.float()).abs().max().item(),
+    )
+    print(
+        "ref2va-embeddings:", len(token_ids), "tokens, hidden_0", tuple(embedded.shape),
+        "image_features", tuple(first(image_features).shape),
+        "video_features", tuple(first(video_features).shape),
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("component", choices=["audio-vae", "video-vae", "video-vae-encode", "vision-tower", "text-layer0", "dit-block0", "keyframe-preprocess", "text-layer0-mm", "conditioner-fl2va"])
+    parser.add_argument("component", choices=["audio-vae", "video-vae", "video-vae-encode", "vision-tower", "text-layer0", "dit-block0", "keyframe-preprocess", "text-layer0-mm", "conditioner-fl2va", "ref-normalize", "audio-vae-encode", "video-condition", "conditioner-ref2va", "vision-tower-large", "ref2va-embeddings"])
     parser.add_argument("--models-dir", default=os.environ.get("H3_MODELS_DIR", "/tmp/MiniMax-H3"))
     args = parser.parse_args()
     models_dir = pathlib.Path(args.models_dir)
@@ -521,6 +1099,12 @@ def main() -> None:
         "keyframe-preprocess": dump_keyframe_preprocess,
         "text-layer0-mm": dump_text_layer0_mm,
         "conditioner-fl2va": dump_conditioner_fl2va,
+        "ref-normalize": dump_ref_normalize,
+        "audio-vae-encode": dump_audio_vae_encode,
+        "video-condition": dump_video_condition,
+        "conditioner-ref2va": dump_conditioner_ref2va,
+        "vision-tower-large": dump_vision_tower_large,
+        "ref2va-embeddings": dump_ref2va_embeddings,
     }[args.component](models_dir)
 
 

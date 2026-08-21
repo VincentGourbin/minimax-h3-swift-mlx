@@ -2,10 +2,15 @@
 okf_version: "0.1"
 kind: playbook
 created: 2026-08-20
-status: ready to implement — issues #8 (Phase A), #9 (Phase B), #10 (Phase C)
+status: A/B/C implemented; parity closed (see the investigation note); first clip generated 2026-08-21; human judgment on a quality clip pending
 ---
 
 # Porting ref2va — the handoff plan
+
+> **Implemented 2026-08-20.** Everything below stands as the contract; the corrections and
+> discoveries the implementation turned up are collected in
+> [What the implementation changed](#what-the-implementation-changed) at the end. Read that section
+> too — one item in the plan below is simply **wrong** against the Python.
 
 This document carries everything needed to implement `ref2va` without re-deriving it from the
 Python. The contracts below were extracted from the diffusers reference on `main`
@@ -226,3 +231,64 @@ with the evidence, and the knowledge log carries what was learned.
   re-run `merge-lora` first (~3 min; the LoRA files live in `.local-runs/loras/`).
 - Phases A and B need no checkpoint beyond what is already on the SSD; only Phase C waits on the
   download.
+
+---
+
+## What the implementation changed
+
+### One correction to the plan above
+
+**A video reference that carries a soundtrack also takes an `"<Audio j>: "` label, emitted BEFORE
+its `"<Video k>: "`.** The plan says `"<Audio j>: "` belongs to audio references; the Python
+(`_build_presentation`) emits it for *any* reference whose `has_audio` is true, video included, and
+the audio counter therefore runs across both modalities. A soundtrack-bearing video reference
+contributes two labels, in the same order its rows are packed. Anything that builds the label list
+— the presentation, and the prompt rewriter, which must use the same labels or it points at
+conditioning that is not there — has to know this.
+
+### Three things the plan did not know
+
+1. **The vision tower needs no temporal axis.** Qwen3-VL segments its vision attention per temporal
+   group (`cu_seqlens = repeat_interleave(h * w, t)`) and its rotary table carries only `(h, w)`,
+   so a `grid_t = N` tower call is *exactly* N independent `grid_t = 1` calls. Measured against the
+   checkpoint at **max|Δ| = 0.0** (`parity video-condition`, which carries both tensors precisely so
+   the equality is checked rather than assumed). A video reference is therefore processed one merged
+   frame pair at a time through the existing image path — no tower change at all.
+
+2. **Qwen3-VL's video `smart_resize` is not a pass-through past ~12.5 s of reference.** Its budget is
+   `ceil(T/2) * 2 * h * w <= 25 165 824` over the whole clip, and 31 sampled frames (a 15 s
+   reference) at the largest 768x1344 canvas come to 33 M — the processor then downscales with
+   BICUBIC. Implemented (the PIL-exact separable resampler gained a Keys `a = -0.5` kernel); not
+   reachable on the official 5 s case, so its tolerance is unmeasured against torchvision.
+
+3. **`buildRowTimesteps` had to be rewritten, and the rewrite covers both modes.** It assumed the
+   conditioning rows were a contiguous prefix of the sequence — true for fl2va, false for ref2va,
+   where reference blocks sit between the text and the generated rows in request order. It now
+   assigns through the gather orders (`videoIndices` / `audioIndices`), which is the reference's own
+   formulation and needs no per-mode branch.
+
+Plus one latent bug found on the way: `resolveCanvasSize` rounded half-away-from-zero where Python
+rounds **half-to-even**. Unreachable until a video reference brings its own aspect ratio; fixed.
+
+### Parity measured
+
+| probe | result |
+| --- | --- |
+| `ref-normalize` — video pass-through (24 fps, already on canvas) | **bit-exact** (0.0) |
+| `ref-normalize` — 30 -> 24 fps resample + LANCZOS canvas | **bit-exact** (0.0) |
+| `ref-normalize` — image reference, 2048 short edge | **bit-exact** (0.0) |
+| `ref-normalize` — soundtrack 44.1 -> 32 kHz | max\|Δ\| 7.4e-6 (scale 1.0) |
+| `ref-normalize` — mono 16 -> 32 kHz + upmix | max\|Δ\| 2.4e-7 |
+| `audio-vae-encode` — posterior mean / log std | 9.1e-5 (scale 4.46) / 1.0e-5 |
+| `video-condition` — `pixel_values_videos` | 5.9e-8 |
+| `video-condition` — vision embeds, per group AND vs whole clip | 2.2e-4 (scale 16.6) |
+
+The soundtrack resampler is a port of `torchaudio.transforms.Resample`'s `sinc_interp_hann`
+(`lowpass_filter_width` 6, `rolloff` 0.99, polyphase kernels built in float64 and applied in
+float32); 7.4e-6 is the tolerance to hold it to.
+
+### One pitfall paid for
+
+Transcribing an `nn.Sequential` as a Swift struct with `"0"`..`"N"` keys builds the right tree and
+then fails to load: MLXNN unflattens contiguous numeric keys into an **array**. See
+[mlxnn-numeric-key-unflattening](../pitfalls/mlxnn-numeric-key-unflattening.md).

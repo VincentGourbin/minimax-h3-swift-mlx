@@ -84,9 +84,11 @@ public enum H3Geometry {
             width *= scale
             height *= scale
         }
+        // Python `round` is half-to-even; a video reference's own aspect ratio lands on exact
+        // halves often enough that half-away-from-zero would resolve a different canvas.
         let m = H3Constants.canvasMultiple
-        let roundedHeight = max(m, Int((height / Double(m)).rounded()) * m)
-        let roundedWidth = max(m, Int((width / Double(m)).rounded()) * m)
+        let roundedHeight = max(m, Int((height / Double(m)).rounded(.toNearestOrEven)) * m)
+        let roundedWidth = max(m, Int((width / Double(m)).rounded(.toNearestOrEven)) * m)
         return (roundedHeight, roundedWidth)
     }
 
@@ -183,6 +185,16 @@ public struct H3PackedSequence {
     public let numConditionAudioRows: Int
     /// Host-side copy of the per-row tags, kept for timestep-plan construction.
     public let tokenTagValues: [Int32]
+    /// Host-side copies of the gather orders, conditioning rows first. A `ref2va` layout
+    /// interleaves reference blocks with each other, so the timestep plan cannot assume the
+    /// conditioning rows are a contiguous prefix of the sequence — only of these arrays.
+    public let videoIndexValues: [Int32]
+    public let audioIndexValues: [Int32]
+    /// Where every row of `[text | video rows | audio rows]` lands in the packed sequence, as a
+    /// gather the transformer applies to that concatenation. `nil` when the layout is already
+    /// contiguous (`[text | condition video | audio | target video]`, i.e. t2va and fl2va), where
+    /// plain concatenation reproduces the reference's `index_copy` scatter on its own.
+    public let packedGatherOrder: MLXArray?
     /// Host-side row spans (text length etc.) used when assigning row timesteps.
     public let numTextTokens: Int
     public let numAudioRows: Int
@@ -326,6 +338,9 @@ extension H3Packing {
             numConditionVideoRows: numConditionRows,
             numConditionAudioRows: 0,
             tokenTagValues: tagValues,
+            videoIndexValues: videoIndexValues,
+            audioIndexValues: audioIndexValues,
+            packedGatherOrder: nil,
             numTextTokens: numTextTokens,
             numAudioRows: numAudioRows,
             numVideoRows: numVideoRows
@@ -344,15 +359,19 @@ extension H3Packing {
         conditionVideoTimestep: Float,
         conditionAudioTimestep: Float
     ) -> (timesteps: [Float], timestepIndices: MLXArray) {
-        let conditionStart = layout.numTextTokens
-        let audioStart = conditionStart + layout.numConditionVideoRows
-        let videoStart = audioStart + layout.numAudioRows
-
+        // Assigned through the gather orders rather than through sequence spans: in a `ref2va`
+        // layout the reference blocks sit between the text and the generated rows in request
+        // order, so "the conditioning rows" is a prefix of `videoIndices` / `audioIndices` and of
+        // nothing else. Text rows keep the video timestep — they never reach an output head.
         var rowTimesteps = [Float](repeating: videoTimestep, count: layout.sequenceLength)
-        for index in conditionStart..<audioStart { rowTimesteps[index] = conditionVideoTimestep }
-        for index in audioStart..<videoStart {
-            let isCondition = (index - audioStart) < layout.numConditionAudioRows
-            rowTimesteps[index] = isCondition ? conditionAudioTimestep : audioTimestep
+        for index in layout.videoIndexValues.prefix(layout.numConditionVideoRows) {
+            rowTimesteps[Int(index)] = conditionVideoTimestep
+        }
+        for index in layout.audioIndexValues.dropFirst(layout.numConditionAudioRows) {
+            rowTimesteps[Int(index)] = audioTimestep
+        }
+        for index in layout.audioIndexValues.prefix(layout.numConditionAudioRows) {
+            rowTimesteps[Int(index)] = conditionAudioTimestep
         }
 
         let distinct = Array(Set(rowTimesteps)).sorted()

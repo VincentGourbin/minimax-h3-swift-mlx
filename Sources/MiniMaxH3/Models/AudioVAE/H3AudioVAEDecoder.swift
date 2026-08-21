@@ -16,8 +16,11 @@ import MLXNN
 // MARK: - Configuration
 
 public struct H3AudioVAEConfig: Codable, Sendable {
+    public var encoderDim = 64
+    public var encoderRates = [2, 4, 4, 5, 5]
     public var latentDim = 2048
     public var latentChannels = 32
+    public var numAttentionHeads = 8
     public var decoderDim = 1024
     public var decoderRates = [5, 5, 2, 2, 2, 2, 2]
     public var decoderKernelSizes = [9, 9, 4, 4, 4, 4, 4]
@@ -27,7 +30,13 @@ public struct H3AudioVAEConfig: Codable, Sendable {
     public var latentsMean: [Float] = []
     public var latentsStd: [Float] = []
 
+    /// Product of `encoderRates`: 800 samples per latent, i.e. 40 latents/s at 32 kHz.
+    public var hopLength: Int { encoderRates.reduce(1, *) }
+
     enum CodingKeys: String, CodingKey {
+        case encoderDim = "encoder_dim"
+        case encoderRates = "encoder_rates"
+        case numAttentionHeads = "num_attention_heads"
         case latentDim = "latent_dim"
         case latentChannels = "latent_channels"
         case decoderDim = "decoder_dim"
@@ -168,7 +177,7 @@ final class H3AudioActivation1d: Module {
 // MARK: - BigVGAN blocks
 
 /// Plain conv1d over NLC with pre-resolved (weight-norm merged) weights in MLX layout (C_out, K, C_in).
-final class H3AudioConv1d: Module {
+class H3AudioConv1d: H3AudioOp {
     let stride: Int
     let padding: Int
     let dilation: Int
@@ -186,7 +195,7 @@ final class H3AudioConv1d: Module {
         _bias.wrappedValue = bias ? MLXArray.zeros([outChannels]) : nil
     }
 
-    func callAsFunction(_ x: MLXArray) -> MLXArray {
+    override func callAsFunction(_ x: MLXArray) -> MLXArray {
         var out = conv1d(x, weight, stride: stride, padding: padding, dilation: dilation)
         if let bias { out = out + bias }
         return out
@@ -316,21 +325,74 @@ final class H3AudioBigVGANDecoder: Module {
 public final class H3AudioVAE: Module {
     public let config: H3AudioVAEConfig
 
-    @ModuleInfo(key: "dec_in_proj") var decInProj: H3AudioConv1d  // k=1
-    @ModuleInfo(key: "decoder") var decoder: H3AudioBigVGANDecoder
+    @ModuleInfo(key: "dec_in_proj") var decInProj: H3AudioConv1d?  // k=1
+    @ModuleInfo(key: "decoder") var decoder: H3AudioBigVGANDecoder?
+    @ModuleInfo(key: "encoder") var encoder: H3AudioEncoder?
+    @ModuleInfo(key: "pre_block") var preBlock: H3AudioAttnProjection?
+    @ModuleInfo(key: "mean_proj") var meanProj: H3AudioConv1d?
+    @ModuleInfo(key: "logs_proj") var logsProj: H3AudioConv1d?
 
-    public init(config: H3AudioVAEConfig) {
+    /// - Parameter includeEncoder: ref2va conditions on reference soundtracks and needs the DAC
+    ///   trunk; every other path only decodes.
+    public init(config: H3AudioVAEConfig, includeEncoder: Bool = false, includeDecoder: Bool = true) {
+        precondition(includeEncoder || includeDecoder, "a VAE with neither half is useless")
         self.config = config
-        _decInProj.wrappedValue = H3AudioConv1d(
-            inChannels: config.latentChannels, outChannels: config.latentDim, kernelSize: 1
-        )
-        _decoder.wrappedValue = H3AudioBigVGANDecoder(config: config)
+        _decInProj.wrappedValue = includeDecoder
+            ? H3AudioConv1d(
+                inChannels: config.latentChannels, outChannels: config.latentDim, kernelSize: 1)
+            : nil
+        _decoder.wrappedValue = includeDecoder ? H3AudioBigVGANDecoder(config: config) : nil
+        _encoder.wrappedValue = includeEncoder ? H3AudioEncoder(config: config) : nil
+        _preBlock.wrappedValue = includeEncoder
+            ? H3AudioAttnProjection(
+                inDim: config.latentDim, outDim: config.latentChannels,
+                numHeads: config.numAttentionHeads)
+            : nil
+        _meanProj.wrappedValue = includeEncoder
+            ? H3AudioConv1d(
+                inChannels: config.latentChannels, outChannels: config.latentChannels, kernelSize: 1)
+            : nil
+        _logsProj.wrappedValue = includeEncoder
+            ? H3AudioConv1d(
+                inChannels: config.latentChannels, outChannels: config.latentChannels, kernelSize: 1)
+            : nil
     }
 
     /// latents (B, latentChannels, T) [torch layout, denormalized] -> waveform (B, samples) in [-1, 1].
     public func decode(_ latents: MLXArray) -> MLXArray {
         let x = latents.asType(.float32).transposed(0, 2, 1)  // NLC
-        let decoded = decoder(decInProj(x))  // (B, samples, 1)
+        let decoded = decoder!(decInProj!(x))  // (B, samples, 1)
         return decoded.squeezed(axis: -1)
+    }
+
+    /// Encode a mono waveform into the latent posterior.
+    ///
+    /// MiniMax-H3 passes a stereo reference as `batch = 2`, and always consumes the **mean**: the
+    /// `logs_proj` head exists in the checkpoint but the reference pipeline never reads it, and no
+    /// seed is involved in conditioning on a soundtrack.
+    ///
+    /// - Parameter waveform: `(batch, samples)` float32, right-padded here to a multiple of the
+    ///   800-sample hop.
+    /// - Returns: `(mean, logStd)`, both `(batch, latentChannels, samples / 800)` in torch layout.
+    public func encode(_ waveform: MLXArray) throws -> (mean: MLXArray, logStd: MLXArray) {
+        guard let encoder, let preBlock, let meanProj, let logsProj else {
+            throw H3Error.invalidInput("This audio VAE was loaded without its encoder.")
+        }
+        guard waveform.ndim == 2 else {
+            throw H3Error.invalidInput(
+                "`waveform` must be (batch, samples), got \(waveform.shape).")
+        }
+        let hop = config.hopLength
+        let samples = waveform.dim(1)
+        let rightPad = (samples + hop - 1) / hop * hop - samples
+        var x = waveform.asType(.float32).expandedDimensions(axis: -1)  // NLC, C = 1
+        if rightPad > 0 {
+            x = padded(x, widths: [.init((0, 0)), .init((0, rightPad)), .init((0, 0))])
+        }
+        var hidden = encoder(x)          // (B, T, latentDim) NLC
+        hidden = preBlock(hidden)        // (B, T, latentChannels)
+        let mean = meanProj(hidden).transposed(0, 2, 1)
+        let logStd = logsProj(hidden).transposed(0, 2, 1)
+        return (mean, logStd)
     }
 }
