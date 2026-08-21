@@ -359,10 +359,16 @@ public final class H3AudioVAE: Module {
     }
 
     /// latents (B, latentChannels, T) [torch layout, denormalized] -> waveform (B, samples) in [-1, 1].
-    public func decode(_ latents: MLXArray) -> MLXArray {
+    ///
+    /// Throws rather than trapping when the VAE was loaded encoder-only: `includeDecoder: false`
+    /// is reachable from the public loader (ref2va encodes soundtracks with it), so this is an
+    /// ordinary caller mistake, not a programmer invariant.
+    public func decode(_ latents: MLXArray) throws -> MLXArray {
+        guard let decoder, let decInProj else {
+            throw H3Error.invalidInput("This audio VAE was loaded without its decoder.")
+        }
         let x = latents.asType(.float32).transposed(0, 2, 1)  // NLC
-        let decoded = decoder!(decInProj!(x))  // (B, samples, 1)
-        return decoded.squeezed(axis: -1)
+        return decoder(decInProj(x)).squeezed(axis: -1)  // (B, samples)
     }
 
     /// Encode a mono waveform into the latent posterior.

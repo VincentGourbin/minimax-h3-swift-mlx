@@ -73,7 +73,15 @@ struct EnhanceCommand: AsyncParsableCommand {
                 case .video:
                     // A soundtrack takes an `<Audio j>` label of its own, ahead of the video's —
                     // the presentation emits them in that order, so the rewrite must see them so.
-                    if try await H3MediaDecoder.hasAudioTrack(at: url) {
+                    //
+                    // The test has to be the one `generate` will apply, not merely "the container
+                    // has an audio track": `generate` decodes the soundtrack bounded to the
+                    // generated duration and treats an empty result as no soundtrack. A track that
+                    // yields no samples in that window would otherwise make this side emit
+                    // `<Audio 1>` while the presentation does not — and every later label shifts
+                    // by one, pointing the prompt at conditioning that is not there.
+                    let soundtrack = try? await H3MediaDecoder.decodeAudio(at: url, maxDuration: duration)
+                    if soundtrack != nil {
                         audios += 1
                         print("Analyzing <Audio \(audios)> (soundtrack)…")
                         analyses.append(H3ReferenceAnalysis(

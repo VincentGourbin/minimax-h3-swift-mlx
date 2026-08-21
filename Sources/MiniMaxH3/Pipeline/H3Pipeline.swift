@@ -393,6 +393,16 @@ public final class H3Pipeline {
                 block.latentFrames = latents.dim(2)
                 block.latentHeight = latents.dim(3)
                 block.latentWidth = latents.dim(4)
+                // Caught here rather than 50 layers deep: a latent grid the patch does not divide
+                // surfaces in the reference as an `index_copy` shape error inside the transformer,
+                // which says nothing about which reference caused it.
+                guard block.latentHeight % patchSize.h == 0, block.latentWidth % patchSize.w == 0
+                else {
+                    throw H3Error.invalidInput(
+                        "Reference \(blocks.count + 1) encodes to "
+                            + "\(block.latentHeight)x\(block.latentWidth) latents, which the "
+                            + "\(patchSize.h)x\(patchSize.w) patch does not divide.")
+                }
             }
             if reference.hasAudio {
                 block.audioRows = audioRows[nextAudio].dim(0)
@@ -417,6 +427,10 @@ public final class H3Pipeline {
 
 
     public func generate(_ request: H3GenerationRequest) async throws -> H3GenerationResult {
+        // Mutable so the raw reference media can be dropped the moment it has been normalized:
+        // decoded frames are held at their SOURCE resolution, and a 4K clip is gigabytes that
+        // must not still be resident when the 52 GB conditioner lands.
+        var request = request
         // 1. Geometry. The first keyframe (if any) is the geometry anchor: it sets the canvas
         // aspect and is stretched onto it; a second keyframe follows and is cover-cropped.
         var keyframes = [H3KeyframeImage]()
@@ -475,6 +489,9 @@ public final class H3Pipeline {
         let references = isRef2VA
             ? try H3ReferenceNormalizer.normalize(request.references, numFrames: numFrames)
             : []
+        // The normalized copy is the only one anything downstream reads; the source-resolution
+        // frames are dead weight from here on and the next stage is the largest one in the run.
+        request.references = []
 
         // 2. Text conditioning (vision tower first for fl2va / ref2va), then free the encoder
         // before anything big loads.
@@ -692,7 +709,7 @@ public final class H3Pipeline {
         let aMean = MLXArray(audioVAE.config.latentsMean).reshaped(1, -1, 1)
         let aStd = MLXArray(audioVAE.config.latentsStd).reshaped(1, -1, 1)
         audioLatentTensor = audioLatentTensor * aStd + aMean
-        let waveform = audioVAE.decode(audioLatentTensor)  // (2, samples)
+        let waveform = try audioVAE.decode(audioLatentTensor)  // (2, samples)
         eval(waveform)
         Memory.clearCache()
         profiler.end("Audio Decode")

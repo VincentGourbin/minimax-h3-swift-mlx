@@ -84,7 +84,7 @@ public enum H3MediaDecoder {
         var frames = [H3KeyframeImage]()
         while let sample = output.copyNextSampleBuffer() {
             guard let buffer = CMSampleBufferGetImageBuffer(sample) else { continue }
-            frames.append(rgbFrame(from: buffer).rotatedClockwise(quarterTurns: turns))
+            frames.append(try rgbFrame(from: buffer).rotatedClockwise(quarterTurns: turns))
         }
         if reader.status == .failed {
             throw H3Error.invalidInput(
@@ -99,15 +99,20 @@ public enum H3MediaDecoder {
         return H3VideoReference(frames: frames, fps: fps, audio: soundtrack)
     }
 
-    /// One BGRA pixel buffer as interleaved RGB.
-    private static func rgbFrame(from buffer: CVImageBuffer) -> H3KeyframeImage {
+    /// One BGRA pixel buffer as interleaved RGB. Throws rather than yielding a black frame if
+    /// the buffer cannot be mapped: the frame count would still line up, so a silently black
+    /// frame would be conditioned on with nothing downstream able to notice.
+    private static func rgbFrame(from buffer: CVImageBuffer) throws -> H3KeyframeImage {
         CVPixelBufferLockBaseAddress(buffer, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
         let width = CVPixelBufferGetWidth(buffer)
         let height = CVPixelBufferGetHeight(buffer)
         let stride = CVPixelBufferGetBytesPerRow(buffer)
+        guard let base = CVPixelBufferGetBaseAddress(buffer) else {
+            throw H3Error.invalidInput("A decoded video frame could not be mapped into memory.")
+        }
         var pixels = [UInt8](repeating: 0, count: width * height * 3)
-        if let base = CVPixelBufferGetBaseAddress(buffer) {
+        do {
             let source = base.assumingMemoryBound(to: UInt8.self)
             pixels.withUnsafeMutableBufferPointer { destination in
                 for y in 0..<height {

@@ -40,7 +40,7 @@ struct ParityCommand: AsyncParsableCommand {
             let reference = try loadArrays(
                 url: parityDir.appendingPathComponent("audio_vae_decode.safetensors"))
             let vae = try H3WeightLoader.loadAudioVAE(modelDirectory: directory)
-            let ours = vae.decode(reference["latents"]!)
+            let ours = try vae.decode(reference["latents"]!)
             try compare(ours: ours, reference: reference["waveform"]!.squeezed(axis: 1), name: "waveform")
 
         case "video-vae":

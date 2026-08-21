@@ -48,7 +48,7 @@ struct CheckpointSmokeTests {
         let vae = try H3WeightLoader.loadAudioVAE(modelDirectory: directory)
         // Two batch items = the two stereo channels the mono VAE decodes separately.
         let latents = MLXArray.zeros([2, 32, 8]).asType(.float32)
-        let waveform = vae.decode(latents)
+        let waveform = try vae.decode(latents)
         eval(waveform)
         #expect(waveform.dim(0) == 2)
         // hop 800 at 32 kHz: 8 latents -> 6400 samples per channel.

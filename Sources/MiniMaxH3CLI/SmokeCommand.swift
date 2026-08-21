@@ -51,7 +51,7 @@ struct SmokeCommand: AsyncParsableCommand {
         print(String(format: "  loaded in %.1f s", Date().timeIntervalSince(start)))
         // 40 latents = 1 s of audio per channel.
         let latents = MLXRandom.normal([2, 32, 40], type: Float.self)
-        let waveform = vae.decode(latents)
+        let waveform = try vae.decode(latents)
         eval(waveform)
         let expected = 40 * 800
         guard waveform.shape == [2, expected] else {

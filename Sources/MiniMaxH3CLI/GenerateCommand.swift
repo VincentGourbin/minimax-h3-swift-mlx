@@ -148,8 +148,11 @@ struct GenerateCommand: AsyncParsableCommand {
         // whether it also takes an `<Audio j>` label, and the labels are the contract between the
         // prompt and the packed sequence. Decoding is bounded by the generated duration — the
         // 24 fps resample maps output slot `j` to a source index that depends only on `j`, so
-        // material past the truncation cannot change the result, and a long 4K clip is never held
-        // whole.
+        // material past the truncation cannot change the result.
+        //
+        // That bound is on TIME, not on pixels: frames are held at their source resolution, so a
+        // 4K reference is still gigabytes. `generate` drops them as soon as it has normalized
+        // them, and this side hands its own copy over rather than keeping one alive alongside.
         let requestDuration = Double(try H3Geometry.alignNumFrames(frames)) / Double(H3Constants.fps)
         var decodedReferences = [H3Reference]()
         if !reference.isEmpty {
@@ -174,6 +177,14 @@ struct GenerateCommand: AsyncParsableCommand {
                         .audio(H3AudioReference(audio: try await H3MediaDecoder.decodeAudio(
                             at: url, maxDuration: requestDuration))))
                 }
+            }
+            // Both checks BEFORE the rewrite: `--enhance-prompt` loads Gemma 4 and analyses every
+            // reference, minutes of work, and the pipeline would only reject the combination
+            // afterwards.
+            guard image == nil, lastImage == nil else {
+                throw ValidationError(
+                    "--reference is the ref2va list; a request is either fl2va (--image / "
+                        + "--last-image) or ref2va (--reference), not both.")
             }
             try H3ReferenceNormalizer.validate(decodedReferences)
             print("References (packed order): "
@@ -263,6 +274,7 @@ struct GenerateCommand: AsyncParsableCommand {
 
         var request = H3GenerationRequest(prompt: finalPrompt)
         request.references = decodedReferences
+        decodedReferences = []  // hand over, do not keep a second copy of the source frames alive
         if let image {
             request.image = try H3KeyframeImage.load(from: URL(fileURLWithPath: image))
         }
