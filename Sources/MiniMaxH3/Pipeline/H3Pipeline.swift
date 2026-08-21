@@ -19,8 +19,13 @@ public struct H3GenerationRequest: Sendable {
     /// fl2va: keyframe the video ends on. Alone it anchors "last" (and sets the canvas aspect);
     /// combined with `image` it follows that canvas and is cover-cropped onto it.
     public var lastImage: H3KeyframeImage?
+    /// ref2va: the ordered reference list — images, videos (with their soundtrack) and audio
+    /// clips. **The order is the request**: it numbers the `<Picture i>` / `<Audio j>` /
+    /// `<Video k>` labels AND lays the blocks out on the shared rotary clock. A non-empty list
+    /// switches the request to ref2va, which runs against `transformer_ref`.
+    public var references: [H3Reference] = []
     /// nil -> canvas resolved from the first keyframe's aspect ratio, else from
-    /// `aspectWidth:aspectHeight` (default 16:9, short edge 768).
+    /// `aspectWidth:aspectHeight` (default 16:9, short edge 768). References never bind it.
     public var height: Int?
     public var width: Int?
     public var aspectWidth: Double = 16
@@ -189,9 +194,243 @@ public final class H3Pipeline {
         return conditionRows
     }
 
+    // MARK: - Stage 1c: ref2va conditioning
+
+    /// Encode the `ref2va` presentation: one label per reference, numbered per modality in request
+    /// order, then the prompt verbatim. Image references go through the vision tower at their own
+    /// 2048-edge resolution; a video reference contributes one timestamped vision block per merged
+    /// frame pair; an audio reference contributes a label and nothing else — a waveform never
+    /// reaches the conditioner.
+    ///
+    /// Every vision block is an independent tower call. That is not an approximation: Qwen3-VL
+    /// segments its vision attention per temporal group and its rotary table has no temporal axis,
+    /// so a `grid_t = N` call and N `grid_t = 1` calls are the same tensor (checked against the
+    /// checkpoint by the `video-condition` parity probe, which measured max|Δ| 0).
+    func encodeRef2VAPrompt(
+        _ prompt: String, references: [H3Reference], quantization: H3Quantization
+    ) async throws -> (embeds: MLXArray, tags: [Int32]) {
+        let profiler = H3Profiler.shared
+        report("Loading tokenizer")
+        profiler.start("Tokenization")
+        let tokenizer = try await AutoTokenizer.from(
+            modelFolder: modelDirectory.appendingPathComponent("tokenizer"))
+        profiler.end("Tokenization")
+
+        // Prepare every reference's vision blocks first, so the tower is loaded once and freed
+        // before the 52 GB text stack lands.
+        var presentationReferences = [H3PresentationReference]()
+        var visionBlocks = [(patches: MLXArray, gridH: Int, gridW: Int)]()
+        for reference in references {
+            switch reference {
+            case .image(let entry):
+                let (patches, gridH, gridW) = entry.image.visionPatches()
+                visionBlocks.append((patches, gridH, gridW))
+                presentationReferences.append(.image(gridH: gridH, gridW: gridW))
+            case .video(let entry):
+                let prepared = try H3ReferenceVideoProcessor.prepare(frames: entry.frames)
+                for block in prepared.blocks {
+                    visionBlocks.append((block, prepared.gridH, prepared.gridW))
+                }
+                presentationReferences.append(
+                    entry.audio == nil
+                        ? .video(
+                            gridH: prepared.gridH, gridW: prepared.gridW,
+                            blockTimestamps: prepared.blockTimestamps)
+                        : .videoWithAudio(
+                            gridH: prepared.gridH, gridW: prepared.gridW,
+                            blockTimestamps: prepared.blockTimestamps))
+            case .audio:
+                presentationReferences.append(.audio)
+            }
+        }
+
+        var imageEmbeds: MLXArray?
+        var deepstack = [MLXArray]()
+        if !visionBlocks.isEmpty {
+            report("Encoding \(visionBlocks.count) reference vision block(s)")
+            profiler.start("Vision Tower")
+            var tower: Qwen3VLVisionTower? = try H3WeightLoader.loadVisionTower(
+                modelDirectory: modelDirectory)
+            var embedsPerBlock = [MLXArray]()
+            var deepstackPerBlock = [[MLXArray]]()
+            for block in visionBlocks {
+                let (embeds, taps) = tower!(block.patches, gridH: block.gridH, gridW: block.gridW)
+                embedsPerBlock.append(embeds)
+                deepstackPerBlock.append(taps)
+                eval([embeds] + taps)
+            }
+            imageEmbeds = concatenated(embedsPerBlock, axis: 0)
+            deepstack = (0..<deepstackPerBlock[0].count).map { level in
+                concatenated(deepstackPerBlock.map { $0[level] }, axis: 0)
+            }
+            eval([imageEmbeds!] + deepstack)
+            tower = nil
+            Memory.clearCache()
+            profiler.end("Vision Tower")
+        }
+
+        let presentation = try H3Presentation.ref2va(
+            prompt: prompt, references: presentationReferences, tokenizer: tokenizer)
+        let layout = try presentation.multimodalLayout()
+
+        report("Loading text encoder (Qwen3-VL-32B, layers 0-49)")
+        profiler.start("Load Text Encoder")
+        let encoder = try H3WeightLoader.loadTextEncoder(
+            modelDirectory: modelDirectory, quantization: quantization)
+        profiler.end("Load Text Encoder")
+
+        report("Encoding presentation (\(presentation.tokenIds.count) tokens)")
+        profiler.start("Text Encoding")
+        let embeds = encoder(
+            MLXArray(presentation.tokenIds).expandedDimensions(axis: 0),
+            imageEmbeds: imageEmbeds,
+            deepstack: deepstack,
+            layout: layout)
+        eval(embeds)
+        profiler.end("Text Encoding")
+        return (embeds, presentation.tokenTags)
+    }
+
+    /// What the reference encoders produced, in packed order.
+    struct H3EncodedReferences {
+        /// One `(1, 24, F, H, W)` normalized conditioning latent per image and video reference.
+        var conditionLatents: [MLXArray]
+        /// One `(latents * 2, 32)` channel-major row block per audio-bearing reference.
+        var audioRows: [MLXArray]
+        /// The block geometry the packed layout is built from.
+        var blocks: [H3ReferenceBlockGeometry]
+    }
+
+    /// Encode the references: images and videos through the video VAE, soundtracks and audio
+    /// references through the audio VAE.
+    ///
+    /// The visual recipe is the keyframe one (`encode_vae_condition`): ImageNet-normalized pixels,
+    /// a posterior *sampled* under a fresh seed-42 generator per reference, the sample rounded
+    /// through float16 BEFORE normalization. Soundtracks take the posterior **mean** and are never
+    /// sampled — no seed is involved in conditioning on audio.
+    func encodeReferences(
+        _ references: [H3Reference], patchSize: (t: Int, h: Int, w: Int)
+    ) throws -> H3EncodedReferences {
+        let profiler = H3Profiler.shared
+        report("Encoding \(references.count) reference(s) (VAEs)")
+        profiler.start("Reference VAE Encode")
+
+        var conditionLatents = [MLXArray]()
+        var audioRows = [MLXArray]()
+        var blocks = [H3ReferenceBlockGeometry]()
+
+        // Visual side first, then the audio VAE: never two model stacks resident.
+        if references.contains(where: { $0.kind != .audio }) {
+            var vae: H3VideoVAE? = try H3WeightLoader.loadVideoVAE(
+                modelDirectory: modelDirectory, includeEncoder: true, includeDecoder: false)
+            let latentsMean = MLXArray(vae!.config.latentsMean).reshaped(1, -1, 1, 1, 1)
+            let latentsStd = MLXArray(vae!.config.latentsStd).reshaped(1, -1, 1, 1, 1)
+            let pixelMean = MLXArray(H3Constants.pixelMean).reshaped(1, -1, 1, 1, 1)
+            let pixelStd = MLXArray(H3Constants.pixelStd).reshaped(1, -1, 1, 1, 1)
+
+            for reference in references {
+                let frames: [H3KeyframeImage]
+                switch reference {
+                case .audio: continue
+                case .image(let entry): frames = [entry.image]
+                case .video(let entry):
+                    // Snap *down* to `17n + 5` so the VAE encodes without padding. `max(1, ...)`
+                    // can nominate more frames than the reference carries, which the reference
+                    // implementation resolves by slicing — so does this.
+                    let count = entry.frames.count
+                    let chunks = max(1, floorDivide(count - H3Constants.latentsPerChunk, H3Constants.framesPerChunk))
+                    let wanted = chunks * H3Constants.framesPerChunk + H3Constants.latentsPerChunk
+                    frames = Array(entry.frames.prefix(wanted))
+                }
+                let (height, width) = (frames[0].height, frames[0].width)
+                var pixels = MLXArray(frames.flatMap(\.pixels), [frames.count, height, width, 3])
+                    .asType(.float32)
+                    .transposed(3, 0, 1, 2)
+                    .expandedDimensions(axis: 0)  // (1, 3, T, H, W)
+                pixels = (pixels / 255.0 - pixelMean) / pixelStd
+                let moments = try vae!.encodeVideo(pixels)
+                let channels = moments.dim(1) / 2
+                let mean = moments[0..., ..<channels]
+                let logvar = clip(moments[0..., channels...], min: -30.0, max: 20.0)
+                MLXRandom.seed(H3Constants.keyframeEncodeSeed)
+                let sampled = mean + exp(0.5 * logvar) * MLXRandom.normal(mean.shape, type: Float.self)
+                let latents = sampled.asType(.float16).asType(.float32)
+                let normalized = (latents - latentsMean) / latentsStd
+                eval(normalized)
+                conditionLatents.append(normalized)
+            }
+            vae = nil
+            Memory.clearCache()
+        }
+
+        if references.contains(where: \.hasAudio) {
+            let vae = try H3WeightLoader.loadAudioVAE(
+                modelDirectory: modelDirectory, includeEncoder: true, includeDecoder: false)
+            let mean = MLXArray(vae.config.latentsMean).reshaped(1, 1, -1)
+            let std = MLXArray(vae.config.latentsStd).reshaped(1, 1, -1)
+            for reference in references {
+                guard let buffer = reference.audioBuffer else { continue }
+                // Stereo as two batch items of the mono VAE; the posterior MODE, never a sample.
+                let waveform = MLXArray(buffer.samples, [buffer.channels, buffer.frameCount])
+                let (posteriorMean, _) = try vae.encode(waveform)
+                let latents = posteriorMean.transposed(0, 2, 1)  // (2, T, 32)
+                let normalized = ((latents - mean) / std).reshaped(-1, vae.config.latentChannels)
+                eval(normalized)
+                audioRows.append(normalized)
+            }
+            Memory.clearCache()
+        }
+
+        // Walk the references once more to assemble the geometry, consuming the two lists in the
+        // order they were filled — they skip the references they do not apply to.
+        var nextVisual = 0
+        var nextAudio = 0
+        for reference in references {
+            var block = H3ReferenceBlockGeometry(kind: reference.kind)
+            if reference.kind != .audio {
+                let latents = conditionLatents[nextVisual]
+                nextVisual += 1
+                block.latentFrames = latents.dim(2)
+                block.latentHeight = latents.dim(3)
+                block.latentWidth = latents.dim(4)
+                // Caught here rather than 50 layers deep: a latent grid the patch does not divide
+                // surfaces in the reference as an `index_copy` shape error inside the transformer,
+                // which says nothing about which reference caused it.
+                guard block.latentHeight % patchSize.h == 0, block.latentWidth % patchSize.w == 0
+                else {
+                    throw H3Error.invalidInput(
+                        "Reference \(blocks.count + 1) encodes to "
+                            + "\(block.latentHeight)x\(block.latentWidth) latents, which the "
+                            + "\(patchSize.h)x\(patchSize.w) patch does not divide.")
+                }
+            }
+            if reference.hasAudio {
+                block.audioRows = audioRows[nextAudio].dim(0)
+                nextAudio += 1
+            }
+            blocks.append(block)
+        }
+        profiler.end("Reference VAE Encode")
+        return H3EncodedReferences(
+            conditionLatents: conditionLatents, audioRows: audioRows, blocks: blocks)
+    }
+
+    /// Python's floor division, which the reference's `(T - 5) // 17` relies on for short clips.
+    private func floorDivide(_ numerator: Int, _ denominator: Int) -> Int {
+        let quotient = numerator / denominator
+        return (numerator % denominator != 0 && (numerator < 0) != (denominator < 0))
+            ? quotient - 1 : quotient
+    }
+
     // MARK: - Generation
 
+
+
     public func generate(_ request: H3GenerationRequest) async throws -> H3GenerationResult {
+        // Mutable so the raw reference media can be dropped the moment it has been normalized:
+        // decoded frames are held at their SOURCE resolution, and a 4K clip is gigabytes that
+        // must not still be resident when the 52 GB conditioner lands.
+        var request = request
         // 1. Geometry. The first keyframe (if any) is the geometry anchor: it sets the canvas
         // aspect and is stretched onto it; a second keyframe follows and is cover-cropped.
         var keyframes = [H3KeyframeImage]()
@@ -203,6 +442,12 @@ public final class H3Pipeline {
         if let lastImage = request.lastImage {
             keyframes.append(lastImage)
             keyframeAnchors.append("last")
+        }
+
+        let isRef2VA = !request.references.isEmpty
+        guard !isRef2VA || keyframes.isEmpty else {
+            throw H3Error.invalidInput(
+                "A request is either `fl2va` (keyframes) or `ref2va` (references), not both.")
         }
 
         let (height, width): (Int, Int)
@@ -238,28 +483,69 @@ public final class H3Pipeline {
             "canvas \(width)x\(height), \(numFrames) frames -> latents \(latentFrames)x\(latentHeight)x\(latentWidth), "
                 + "\(audioLatents) audio latents/channel")
 
-        // 2. Text conditioning (vision tower first for fl2va), then free the encoder before
-        // anything big loads.
-        let (promptEmbeds, textTags) = try await encodePrompt(
-            request.prompt, keyframes: keyframes, quantization: request.textEncoderQuantization)
+        // 1b. ref2va: normalize the references onto H3's own rates and resolutions. This has to
+        // happen after the frame count is final — a soundtrack is truncated to the generated
+        // duration.
+        let references = isRef2VA
+            ? try H3ReferenceNormalizer.normalize(request.references, numFrames: numFrames)
+            : []
+        // The normalized copy is the only one anything downstream reads; the source-resolution
+        // frames are dead weight from here on and the next stage is the largest one in the run.
+        request.references = []
+
+        // 2. Text conditioning (vision tower first for fl2va / ref2va), then free the encoder
+        // before anything big loads.
+        let (promptEmbeds, textTags) = isRef2VA
+            ? try await encodeRef2VAPrompt(
+                request.prompt, references: references,
+                quantization: request.textEncoderQuantization)
+            : try await encodePrompt(
+                request.prompt, keyframes: keyframes,
+                quantization: request.textEncoderQuantization)
         Memory.clearCache()
 
-        // 2b. Keyframe conditioning rows (before noise augmentation).
-        var conditionRows = keyframes.isEmpty
-            ? nil : try encodeKeyframes(keyframes, patchSize: patch)
-
-        // 3. Packed layout and schedules.
-        let layout = try H3Packing.buildPackedSequence(
-            textTokenTags: textTags,
-            numLatentFrames: latentFrames,
-            latentHeight: latentHeight,
-            latentWidth: latentWidth,
-            numAudioLatents: audioLatents,
-            patchSize: patch,
-            keyframeAnchors: keyframeAnchors
-        )
+        // 2b. Conditioning latents (before noise augmentation).
+        var conditionRows: MLXArray?
+        var encodedReferences: H3EncodedReferences?
+        let layout: H3PackedSequence
+        if isRef2VA {
+            let encoded = try encodeReferences(references, patchSize: patch)
+            encodedReferences = encoded
+            layout = try H3Packing.buildRef2VAPackedSequence(
+                textTokenTags: textTags,
+                blocks: encoded.blocks,
+                numLatentFrames: latentFrames,
+                latentHeight: latentHeight,
+                latentWidth: latentWidth,
+                numAudioLatents: audioLatents,
+                patchSize: patch)
+        } else {
+            conditionRows = keyframes.isEmpty ? nil : try encodeKeyframes(keyframes, patchSize: patch)
+            // 3. Packed layout and schedules.
+            layout = try H3Packing.buildPackedSequence(
+                textTokenTags: textTags,
+                numLatentFrames: latentFrames,
+                latentHeight: latentHeight,
+                latentWidth: latentWidth,
+                numAudioLatents: audioLatents,
+                patchSize: patch,
+                keyframeAnchors: keyframeAnchors
+            )
+        }
+        if let encoded = encodedReferences {
+            for (index, block) in encoded.blocks.enumerated() {
+                H3Debug.log(
+                    "reference \(index + 1) (\(block.kind.rawValue)): "
+                        + (block.kind == .audio
+                            ? "\(block.audioRows / H3Constants.audioChannels) audio latents"
+                            : "\(block.latentFrames)x\(block.latentHeight)x\(block.latentWidth) latents"
+                                + (block.audioRows > 0
+                                    ? " + \(block.audioRows / H3Constants.audioChannels) audio latents" : "")))
+            }
+        }
         H3Debug.log("packed sequence: \(layout.sequenceLength) rows "
-            + "(\(layout.numConditionVideoRows) condition)")
+            + "(\(layout.numConditionVideoRows) condition video, "
+            + "\(layout.numConditionAudioRows) condition audio)")
 
         let videoScheduler = H3Scheduler(shift: request.flowShift)
         let audioScheduler = H3Scheduler(shift: request.audioFlowShift)
@@ -273,29 +559,69 @@ public final class H3Pipeline {
         // the constant conditioning level (`scale_noise`: t·x0 + (1−t)·noise at t = 0.999) once,
         // and never touched again — they anchor the whole denoising loop.
         MLXRandom.seed(request.seed)
-        if let rows = conditionRows {
+        let aug = H3Constants.keyframeNoiseAug
+        if let encoded = encodedReferences {
+            // One draw per VISUAL condition, in packed order, each at its own shape — `ref2va`
+            // references are encoded at their own resolutions and never share one. Soundtracks are
+            // never noised: a reference waveform conditions clean, at t = 1.0.
+            var packed = [MLXArray]()
+            for condition in encoded.conditionLatents {
+                let noise = MLXRandom.normal(condition.shape, type: Float.self)
+                let noised = aug * condition + (1 - aug) * noise
+                packed.append(H3Packing.patchifyVideoLatents(noised, patchSize: patch))
+            }
+            if !packed.isEmpty {
+                conditionRows = concatenated(packed, axis: 0)
+                eval(conditionRows!)
+                guard conditionRows!.dim(0) == layout.numConditionVideoRows else {
+                    throw H3Error.generationFailed(
+                        "The layout reserved \(layout.numConditionVideoRows) conditioning rows but the "
+                            + "encoded references pack into \(conditionRows!.dim(0)).")
+                }
+            }
+        } else if let rows = conditionRows {
             var noiseRows = [MLXArray]()
             for _ in keyframeAnchors {
                 let noise = MLXRandom.normal([1, 24, 1, latentHeight, latentWidth], type: Float.self)
                 noiseRows.append(H3Packing.patchifyVideoLatents(noise, patchSize: patch))
             }
             let noise = concatenated(noiseRows, axis: 0)
-            let aug = H3Constants.keyframeNoiseAug
             conditionRows = aug * rows + (1 - aug) * noise
             eval(conditionRows!)
         }
         let videoNoise = MLXRandom.normal([1, 24, latentFrames, latentHeight, latentWidth], type: Float.self)
         var videoRows = H3Packing.patchifyVideoLatents(videoNoise, patchSize: patch)
         var audioRows = MLXRandom.normal([audioLatents * H3Constants.audioChannels, 32], type: Float.self)
+        // ref2va: the reference soundtracks sit in front of the generated audio rows and ride
+        // through every step unchanged, exactly as the visual conditioning does on the video side.
+        // Kept apart from `audioRows`, which stays the generated rows the scheduler steps.
+        let referenceAudioBlocks = encodedReferences.map(\.audioRows) ?? []
+        var audioConditionRows: MLXArray?
+        if !referenceAudioBlocks.isEmpty {
+            let rows = referenceAudioBlocks.count == 1
+                ? referenceAudioBlocks[0] : concatenated(referenceAudioBlocks, axis: 0)
+            guard rows.dim(0) == layout.numConditionAudioRows else {
+                throw H3Error.generationFailed(
+                    "The layout reserved \(layout.numConditionAudioRows) reference audio rows but the "
+                        + "encoded soundtracks pack into \(rows.dim(0)).")
+            }
+            audioConditionRows = rows
+            eval(rows)
+        }
         eval(videoRows, audioRows)
 
         // 5. Denoise. One forward per step (guidance-distilled).
         let profiler = H3Profiler.shared
-        report("Loading transformer (61.7 GB)")
+        // `ref2va` runs against its own partition. Its `config.json` is byte-identical to the main
+        // transformer's, so the loader, the quantization filter and the prequantized export all
+        // apply unchanged — the directory name is the only difference.
+        let transformerComponent = isRef2VA ? "transformer_ref" : "transformer"
+        report("Loading \(transformerComponent) (61.7 GB)")
         profiler.start("Load Transformer")
         var transformer: H3Transformer? = try H3WeightLoader.loadTransformer(
             modelDirectory: modelDirectory, quantization: request.transformerQuantization,
-            turboLoRA: request.turboLoRA, turboLoRAStrength: request.turboLoRAStrength)
+            turboLoRA: request.turboLoRA, turboLoRAStrength: request.turboLoRAStrength,
+            component: transformerComponent)
         transformer!.compileBlocks = request.compileBlocks
         transformer!.sparseAttentionKeep = request.sparseAttentionKeep
         Memory.clearCache()
@@ -316,9 +642,11 @@ public final class H3Pipeline {
             )
             let packedVideoRows = conditionRows.map { concatenated([$0, videoRows], axis: 0) }
                 ?? videoRows
+            let packedAudioRows = audioConditionRows.map { concatenated([$0, audioRows], axis: 0) }
+                ?? audioRows
             let (videoVelocity, audioVelocity) = transformer!(
                 videoRows: packedVideoRows,
-                audioRows: audioRows,
+                audioRows: packedAudioRows,
                 textEmbeds: promptEmbeds,
                 timesteps: timesteps,
                 timestepIndices: timestepIndices,
@@ -327,10 +655,12 @@ public final class H3Pipeline {
             // Only the generated rows step; the conditioning rows are never updated.
             let generatedVelocity = conditionRows == nil
                 ? videoVelocity : videoVelocity[layout.numConditionVideoRows...]
+            let generatedAudioVelocity = audioConditionRows == nil
+                ? audioVelocity : audioVelocity[layout.numConditionAudioRows...]
             videoRows = try videoScheduler.step(
                 modelOutput: generatedVelocity, timestep: videoT, sample: videoRows)
             audioRows = try audioScheduler.step(
-                modelOutput: audioVelocity, timestep: audioT, sample: audioRows)
+                modelOutput: generatedAudioVelocity, timestep: audioT, sample: audioRows)
             eval(videoRows, audioRows)
             profiler.recordStep(duration: Date().timeIntervalSince(stepStart))
             if (step + 1) % 5 == 0 { Memory.clearCache() }
@@ -379,7 +709,7 @@ public final class H3Pipeline {
         let aMean = MLXArray(audioVAE.config.latentsMean).reshaped(1, -1, 1)
         let aStd = MLXArray(audioVAE.config.latentsStd).reshaped(1, -1, 1)
         audioLatentTensor = audioLatentTensor * aStd + aMean
-        let waveform = audioVAE.decode(audioLatentTensor)  // (2, samples)
+        let waveform = try audioVAE.decode(audioLatentTensor)  // (2, samples)
         eval(waveform)
         Memory.clearCache()
         profiler.end("Audio Decode")

@@ -4,7 +4,7 @@
 
 Swift MLX port of **MiniMax-H3** (MiniMaxAI/MiniMax-H3): joint video + synchronized stereo audio
 generation on Apple Silicon. 33B guidance-distilled DiT + Qwen3-VL-32B conditioner + video VAE
-(f16t4d24, ViT decoder) + audio VAE (32 kHz stereo). Targets `t2va` then `fl2va` (ref2va out of scope).
+(f16t4d24, ViT decoder) + audio VAE (32 kHz stereo). Covers `t2va`, `fl2va` and `ref2va`.
 
 **INSTRUCTIONS.md is the porting spec** — read it before touching model code. It captures the
 complete architecture, the packing geometry, and the fidelity traps extracted from the diffusers
@@ -25,8 +25,14 @@ xcodebuild -scheme minimax-h3 -configuration Release -derivedDataPath .xcodebuil
 
 ## Tests
 
+**`xcodebuild test` relaunches a crashed worker and still prints `✔ … passed` with exit 0** — and
+each relaunch prints its own partial total, so a moving test count is the tell. Trust `xcrun
+xctest`, whose exit code is real; see
+`docs/knowledge/pitfalls/xcodebuild-test-restarts-after-crash.md`.
+
 ```bash
-# Everything that needs no checkpoint (geometry, mrope layout, presentation, patchify): ~0.4 s
+# Everything that needs no checkpoint (geometry, mrope layout, presentation, patchify, media
+# decode round-trip). Convenient, but see the warning above.
 xcodebuild test -scheme minimax-h3 -destination 'platform=macOS' -derivedDataPath .xcodebuild
 
 # Plus the checkpoint-backed smoke tier. `xcodebuild test` does NOT forward the environment,

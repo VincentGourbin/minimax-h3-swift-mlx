@@ -14,3 +14,6 @@ okf_version: "0.1"
 - [gpu-burst-vs-sustained](pitfalls/gpu-burst-vs-sustained.md) — GPU froid vs chaud = jusqu'à 10× sur le même binaire ; refroidir avant CHAQUE point
 - [bench-reference.tsv](benchmarks/bench-reference.tsv) — références canoniques du banc (à froid) + garde de régression `scripts/bench-guard.sh`
 - [ref2va-port-plan](playbooks/ref2va-port-plan.md) — plan de passation ref2va : contrats exacts extraits de la référence, phases #8/#9/#10, pièges déjà payés
+- [mlxnn-numeric-key-unflattening](pitfalls/mlxnn-numeric-key-unflattening.md) — un nn.Sequential transcrit en clés "0"…"N" se déplie en TABLEAU et casse update(parameters:)
+- [xcodebuild-test-restarts-after-crash](pitfalls/xcodebuild-test-restarts-after-crash.md) — un test qui crashe est relancé et la suite affiche quand même ✔ ; compter les tests ou passer par xcrun xctest
+- [ref2va-conditioner-bf16-2026-08](investigations/ref2va-conditioner-bf16-2026-08.md) — cosinus 0,911 à la profondeur 50 : structure exacte, tour vision bf16 en cause, les quatre coins du dtype

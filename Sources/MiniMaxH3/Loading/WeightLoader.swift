@@ -81,15 +81,20 @@ public enum H3WeightLoader {
     /// - Parameter turboLoRA: a step-distillation LoRA to fold into the weights before
     ///   quantization (see `H3TurboLoRA`). Folding needs the bf16 stage, so passing one disables
     ///   the prequantized fast path rather than quietly loading un-adapted weights.
+    /// - Parameter component: which transformer partition to load. `ref2va` runs against
+    ///   `transformer_ref`, whose `config.json` is byte-identical to the main one — the directory
+    ///   name is the only difference, so the loader, the quantization filter and the prequantized
+    ///   export all apply unchanged.
     public static func loadTransformer(
         modelDirectory: URL,
         numLayers: Int? = nil,
         quantization: H3Quantization = .none,
         skipPrequantizedPickup: Bool = false,
         turboLoRA: URL? = nil,
-        turboLoRAStrength: Float = 1.0
+        turboLoRAStrength: Float = 1.0,
+        component: String = "transformer"
     ) throws -> H3Transformer {
-        let directory = modelDirectory.appendingPathComponent("transformer")
+        let directory = modelDirectory.appendingPathComponent(component)
         var config = try H3TransformerConfig.load(from: directory.appendingPathComponent("config.json"))
         if let numLayers { config.numLayers = numLayers }
         let model = H3Transformer(config: config)
@@ -98,14 +103,14 @@ public enum H3WeightLoader {
         // the exported parameters — reads ~18.5 GB instead of 62 at qint8.
         if !skipPrequantizedPickup, numLayers == nil, turboLoRA == nil,
            H3PrequantizedCheckpoint.exists(
-               modelDirectory: modelDirectory, component: "transformer", quantization: quantization) {
+               modelDirectory: modelDirectory, component: component, quantization: quantization) {
             H3QuantizationFilter.apply(
                 quantization, to: model, exclusions: H3QuantizationFilter.transformerExclusions)
             try H3PrequantizedCheckpoint.load(
                 into: model,
                 from: H3PrequantizedCheckpoint.url(
-                    modelDirectory: modelDirectory, component: "transformer", quantization: quantization),
-                component: "transformer",
+                    modelDirectory: modelDirectory, component: component, quantization: quantization),
+                component: component,
                 quantization: quantization
             )
             return model
@@ -129,7 +134,7 @@ public enum H3WeightLoader {
             try H3TurboLoRA.fold(
                 into: &weights, from: turboLoRA, strength: turboLoRAStrength, remap: transformerRemap)
         }
-        try apply(weights: weights, to: model, component: "transformer")
+        try apply(weights: weights, to: model, component: component)
         if quantization != .none {
             H3QuantizationFilter.apply(
                 quantization, to: model, exclusions: H3QuantizationFilter.transformerExclusions)

@@ -315,6 +315,39 @@ public final class H3VideoVAE: Module {
 
     // MARK: - Encode (keyframes)
 
+    /// Encode a visual condition of any length: `AutoencoderKLMiniMaxH3._encode`.
+    ///
+    /// A single frame has no temporal extent to chunk and goes through the spatial encoder alone —
+    /// padding it up to `clipLength` by repetition instead would run the temporal path over 17
+    /// copies of the same image and return 2 latent frames rather than 1, which is not the
+    /// conditioning MiniMax-H3 was trained with. A frame stack is padded up to a whole number of
+    /// 17-frame chunks by repeating its LAST frame, encoded chunk by chunk, and has its 3 trailing
+    /// latent frames dropped — which is what turns `17n + 5` pixel frames into `5n + 2` latents.
+    ///
+    /// - Parameter pixels: `(1, 3, T, H, W)` torch layout, ImageNet-normalized, float32.
+    public func encodeVideo(_ pixels: MLXArray) throws -> MLXArray {
+        let clipLength = config.clipLength
+        let numFrames = pixels.dim(2)
+        if numFrames == 1 { return try encodeClip(pixels) }
+
+        var x = pixels
+        let padFrames = (clipLength - numFrames % clipLength) % clipLength
+        if padFrames > 0 {
+            let last = x[0..., 0..., (numFrames - 1)..., 0..., 0...]
+            x = concatenated([x] + [MLXArray](repeating: last, count: padFrames), axis: 2)
+        }
+        var chunks = [MLXArray]()
+        for chunk in 0..<(x.dim(2) / clipLength) {
+            chunks.append(try encodeClip(x[0..., 0..., (chunk * clipLength)..<((chunk + 1) * clipLength)]))
+            eval(chunks[chunks.count - 1])
+        }
+        var moments = chunks.count == 1 ? chunks[0] : concatenated(chunks, axis: 2)
+        if config.tokenDrop > 0 {
+            moments = moments[0..., 0..., ..<(moments.dim(2) - config.tokenDrop)]
+        }
+        return moments
+    }
+
     /// Encode one temporal clip (a single keyframe for fl2va), spatially tiled like the
     /// reference. pixels: (1, 3, T, H, W) torch layout, ImageNet-normalized, float32.
     /// Returns moments (1, 2*latentChannels, T', hLat, wLat).

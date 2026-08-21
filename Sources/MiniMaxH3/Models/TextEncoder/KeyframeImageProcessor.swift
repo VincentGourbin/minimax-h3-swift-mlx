@@ -117,6 +117,35 @@ public struct H3KeyframeImage: Sendable {
         return H3KeyframeImage(width: outWidth, height: outHeight, pixels: out)
     }
 
+    // MARK: - Quarter-turn rotation (display matrix)
+
+    /// Rotate clockwise by `quarterTurns` quarter turns — `np.rot90(frames, k: -quarterTurns)`,
+    /// which is how the reference undoes a video's display-matrix rotation.
+    public func rotatedClockwise(quarterTurns: Int) -> H3KeyframeImage {
+        let turns = ((quarterTurns % 4) + 4) % 4
+        guard turns != 0 else { return self }
+        let swapsAxes = turns % 2 == 1
+        let (outWidth, outHeight) = swapsAxes ? (height, width) : (width, height)
+        var out = [UInt8](repeating: 0, count: pixels.count)
+        for y in 0..<outHeight {
+            for x in 0..<outWidth {
+                // Inverse maps of np.rot90(k = -turns) on axes (height, width).
+                let (sy, sx): (Int, Int)
+                switch turns {
+                case 1: (sy, sx) = (height - 1 - x, y)
+                case 2: (sy, sx) = (height - 1 - y, width - 1 - x)
+                default: (sy, sx) = (x, width - 1 - y)
+                }
+                let src = (sy * width + sx) * 3
+                let dst = (y * outWidth + x) * 3
+                out[dst] = pixels[src]
+                out[dst + 1] = pixels[src + 1]
+                out[dst + 2] = pixels[src + 2]
+            }
+        }
+        return H3KeyframeImage(width: outWidth, height: outHeight, pixels: out)
+    }
+
     // MARK: - Canvas preparation (diffusers `prepare_keyframe_image`)
 
     /// Put the keyframe onto the target canvas: stretched for the geometry anchor (first
@@ -159,20 +188,44 @@ public struct H3KeyframeImage: Sendable {
         var coefficients: [[Int32]]
     }
 
-    /// Lanczos-3 kernel: sinc(x)·sinc(x/3) on |x| < 3.
-    private static func lanczos(_ x: Double) -> Double {
-        if x <= -3.0 || x >= 3.0 { return 0.0 }
-        if x == 0.0 { return 1.0 }
-        let pix = Double.pi * x
-        return 3.0 * sin(pix) * sin(pix / 3.0) / (pix * pix)
+    /// The two separable kernels this port needs. LANCZOS is what the released model was
+    /// conditioned on everywhere a keyframe or a reference is put on a canvas; BICUBIC is what
+    /// Qwen3-VL's *video* processor downscales a long reference with (`smart_resize`), and is
+    /// therefore only reachable there.
+    public enum ResampleFilter: Sendable {
+        case lanczos
+        case bicubic
+
+        /// Half-width of the kernel's support, in source pixels at unit scale.
+        var support: Double { self == .lanczos ? 3.0 : 2.0 }
+
+        func weight(_ x: Double) -> Double {
+            switch self {
+            case .lanczos:
+                if x <= -3.0 || x >= 3.0 { return 0.0 }
+                if x == 0.0 { return 1.0 }
+                let pix = Double.pi * x
+                return 3.0 * sin(pix) * sin(pix / 3.0) / (pix * pix)
+            case .bicubic:
+                // Keys cubic with a = -0.5, PIL's `bicubic_filter` (and torchvision's
+                // `antialias=True` BICUBIC, which was built to match it).
+                let a = -0.5
+                let t = abs(x)
+                if t < 1.0 { return ((a + 2.0) * t - (a + 3.0)) * t * t + 1.0 }
+                if t < 2.0 { return (((t - 5.0) * t + 8.0) * t - 4.0) * a }
+                return 0.0
+            }
+        }
     }
 
     /// PIL `precompute_coeffs` + `normalize_coeffs_8bpc`: double-precision windowed taps,
     /// normalized to sum 1, then rounded half-away-from-zero into 22-bit fixed point.
-    private static func resampleAxis(inSize: Int, outSize: Int) -> ResampleAxis {
+    private static func resampleAxis(
+        inSize: Int, outSize: Int, filter: ResampleFilter
+    ) -> ResampleAxis {
         let scale = Double(inSize) / Double(outSize)
         let filterScale = max(scale, 1.0)
-        let support = 3.0 * filterScale
+        let support = filter.support * filterScale
         let inverseScale = 1.0 / filterScale
 
         var bounds = [(min: Int, count: Int)]()
@@ -186,7 +239,7 @@ public struct H3KeyframeImage: Sendable {
             var taps = [Double](repeating: 0, count: high - low)
             var sum = 0.0
             for tap in 0..<taps.count {
-                let weight = lanczos((Double(tap + low) - center + 0.5) * inverseScale) * inverseScale
+                let weight = filter.weight((Double(tap + low) - center + 0.5) * inverseScale) * inverseScale
                 taps[tap] = weight
                 sum += weight
             }
@@ -207,15 +260,22 @@ public struct H3KeyframeImage: Sendable {
         return UInt8(value >> precisionBits)
     }
 
+    /// LANCZOS resize — what every canvas preparation in this port uses.
+    public func resizedLanczos(toWidth outWidth: Int, toHeight outHeight: Int) -> H3KeyframeImage {
+        resized(toWidth: outWidth, toHeight: outHeight, filter: .lanczos)
+    }
+
     /// Two-pass separable resize, horizontal then vertical, rounding to uint8 between passes —
     /// PIL's `ImagingResample` for 8-bit images, bit for bit.
-    public func resizedLanczos(toWidth outWidth: Int, toHeight outHeight: Int) -> H3KeyframeImage {
+    public func resized(
+        toWidth outWidth: Int, toHeight outHeight: Int, filter: ResampleFilter
+    ) -> H3KeyframeImage {
         let rounding = 1 << (Self.precisionBits - 1)
 
         var horizontal = pixels
         var midWidth = width
         if outWidth != width {
-            let axis = Self.resampleAxis(inSize: width, outSize: outWidth)
+            let axis = Self.resampleAxis(inSize: width, outSize: outWidth, filter: filter)
             var out = [UInt8](repeating: 0, count: outWidth * height * 3)
             for y in 0..<height {
                 let rowBase = y * width * 3
@@ -243,7 +303,7 @@ public struct H3KeyframeImage: Sendable {
         guard outHeight != height else {
             return H3KeyframeImage(width: midWidth, height: height, pixels: horizontal)
         }
-        let axis = Self.resampleAxis(inSize: height, outSize: outHeight)
+        let axis = Self.resampleAxis(inSize: height, outSize: outHeight, filter: filter)
         var out = [UInt8](repeating: 0, count: midWidth * outHeight * 3)
         for y in 0..<outHeight {
             let (low, count) = axis.bounds[y]

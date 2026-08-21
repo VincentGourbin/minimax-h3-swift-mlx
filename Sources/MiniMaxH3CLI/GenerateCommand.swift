@@ -11,7 +11,8 @@ struct GenerateCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "generate",
         abstract: "Generate a video with synchronized stereo audio from a text prompt (t2va), "
-            + "optionally anchored on keyframe images (fl2va)."
+            + "optionally anchored on keyframe images (fl2va) or on an ordered list of image, "
+            + "video and audio references (ref2va)."
     )
 
     @Argument(help: "The text prompt.")
@@ -22,6 +23,25 @@ struct GenerateCommand: AsyncParsableCommand {
 
     @Option(name: .long, help: "fl2va: keyframe image the video ends on (alone, generates up to it).")
     var lastImage: String?
+
+    @Option(
+        name: .long, parsing: .singleValue,
+        help: ArgumentHelp(
+            "ref2va: a reference to condition on — an image, a video (its soundtrack comes along) "
+                + "or an audio clip. Repeatable, and THE ORDER IS THE REQUEST: it numbers the "
+                + "<Picture i>/<Audio j>/<Video k> labels and lays the blocks out on the shared "
+                + "rotary clock. At most 9 images, 3 videos, 3 audios, 12 in total; an audio "
+                + "reference cannot be used on its own.",
+            valueName: "file"))
+    var reference: [String] = []
+
+    @Option(
+        name: .long, parsing: .singleValue,
+        help: ArgumentHelp(
+            "Override the frame rate of the Nth --reference video (repeatable, positional with "
+                + "the video references) when its container's metadata is wrong.",
+            valueName: "fps"))
+    var referenceFps: [Double] = []
 
     @Option(name: .shortAndLong, help: "Output MP4 path.")
     var output: String = "output.mp4"
@@ -83,6 +103,24 @@ struct GenerateCommand: AsyncParsableCommand {
     @Flag(name: .long, help: "Verbose debug logging.")
     var debug = false
 
+    /// Which modality a `--reference` file is, by extension. The reference implementation gets
+    /// this from the container; extensions are enough here and keep the CLI from opening every
+    /// file twice just to classify it.
+    static func referenceKind(of url: URL) throws -> H3ReferenceKind {
+        switch url.pathExtension.lowercased() {
+        case "png", "jpg", "jpeg", "webp", "heic", "heif", "bmp", "tif", "tiff", "gif":
+            return .image
+        case "mp4", "mov", "m4v", "avi", "mkv", "webm":
+            return .video
+        case "wav", "mp3", "m4a", "aac", "flac", "aiff", "aif", "caf", "ogg", "opus":
+            return .audio
+        case let other:
+            throw ValidationError(
+                "--reference: cannot tell what modality '\(url.lastPathComponent)' is from its "
+                    + "'.\(other)' extension. Use a known image, video or audio extension.")
+        }
+    }
+
     func run() async throws {
         H3Debug.isEnabled = debug
 
@@ -106,14 +144,102 @@ struct GenerateCommand: AsyncParsableCommand {
             }
         }
 
+        // References are decoded BEFORE the rewrite: whether a video carries a soundtrack decides
+        // whether it also takes an `<Audio j>` label, and the labels are the contract between the
+        // prompt and the packed sequence. Decoding is bounded by the generated duration — the
+        // 24 fps resample maps output slot `j` to a source index that depends only on `j`, so
+        // material past the truncation cannot change the result.
+        //
+        // That bound is on TIME, not on pixels: frames are held at their source resolution, so a
+        // 4K reference is still gigabytes. `generate` drops them as soon as it has normalized
+        // them, and this side hands its own copy over rather than keeping one alive alongside.
+        let requestDuration = Double(try H3Geometry.alignNumFrames(frames)) / Double(H3Constants.fps)
+        var decodedReferences = [H3Reference]()
+        if !reference.isEmpty {
+            var videoIndex = 0
+            for path in reference {
+                let url = URL(fileURLWithPath: path)
+                guard FileManager.default.fileExists(atPath: url.path) else {
+                    throw ValidationError("--reference: no file at \(url.path)")
+                }
+                switch try Self.referenceKind(of: url) {
+                case .image:
+                    decodedReferences.append(
+                        .image(H3ImageReference(image: try H3KeyframeImage.load(from: url))))
+                case .video:
+                    let fpsOverride = videoIndex < referenceFps.count ? referenceFps[videoIndex] : nil
+                    videoIndex += 1
+                    decodedReferences.append(
+                        .video(try await H3MediaDecoder.decodeVideo(
+                            at: url, maxDuration: requestDuration, fpsOverride: fpsOverride)))
+                case .audio:
+                    decodedReferences.append(
+                        .audio(H3AudioReference(audio: try await H3MediaDecoder.decodeAudio(
+                            at: url, maxDuration: requestDuration))))
+                }
+            }
+            // Both checks BEFORE the rewrite: `--enhance-prompt` loads Gemma 4 and analyses every
+            // reference, minutes of work, and the pipeline would only reject the combination
+            // afterwards.
+            guard image == nil, lastImage == nil else {
+                throw ValidationError(
+                    "--reference is the ref2va list; a request is either fl2va (--image / "
+                        + "--last-image) or ref2va (--reference), not both.")
+            }
+            try H3ReferenceNormalizer.validate(decodedReferences)
+            print("References (packed order): "
+                + decodedReferences.map { $0.kind.rawValue }.joined(separator: ", "))
+        }
+
         var finalPrompt = prompt
         if enhancePrompt {
-            let duration = Double(try H3Geometry.alignNumFrames(frames)) / Double(H3Constants.fps)
+            let duration = requestDuration
             // With keyframes, the rewrite MUST see them: the text-only path would emit a T2VA
             // prompt with no `<Picture i>` reference line while the pipeline builds a vision
             // block for that same image — prompt and conditioning would describe different
             // requests, silently.
-            if image != nil || lastImage != nil {
+            if !reference.isEmpty {
+                // Same trap as the keyframe path, one modality wider: the text-only rewrite would
+                // emit a three-field T2VA prompt with no reference lines at all while the pipeline
+                // builds a vision block per reference — prompt and conditioning would describe
+                // different requests, silently.
+                print("Enhancing prompt (Gemma 4 E4B, REF2VA)…")
+                let analyzer = MultimodalContextIR()
+                try await analyzer.load()
+                // Labels are numbered per modality in request order, exactly as the presentation
+                // numbers them — and a video that carries a soundtrack takes an `<Audio j>` label
+                // as well as its `<Video k>`, because that is what the presentation emits.
+                var analyses = [H3ReferenceAnalysis]()
+                var pictures = 0, videos = 0, audios = 0
+                for (index, path) in reference.enumerated() {
+                    let url = URL(fileURLWithPath: path)
+                    let decoded = decodedReferences[index]
+                    if decoded.hasAudio {
+                        audios += 1
+                        analyses.append(H3ReferenceAnalysis(
+                            label: "<Audio \(audios)>",
+                            analysis: try await analyzer.describeAudio(url)))
+                    }
+                    switch decoded.kind {
+                    case .image:
+                        pictures += 1
+                        analyses.append(H3ReferenceAnalysis(
+                            label: "<Picture \(pictures)>",
+                            analysis: try await analyzer.describeImage(url)))
+                    case .video:
+                        videos += 1
+                        analyses.append(H3ReferenceAnalysis(
+                            label: "<Video \(videos)>",
+                            analysis: try await analyzer.describeVideo(url)))
+                    case .audio:
+                        break  // its `<Audio j>` analysis was already appended above
+                    }
+                }
+                finalPrompt = try await analyzer.rewrite(
+                    request: prompt, durationSeconds: duration, variant: .ref2va,
+                    referenceAnalyses: analyses)
+                await analyzer.unload()
+            } else if image != nil || lastImage != nil {
                 let variant: H3EnhanceVariant =
                     image != nil && lastImage != nil ? .fl2va : image != nil ? .i2va : .l2va
                 print("Enhancing prompt (Gemma 4 E4B, \(variant.rawValue.uppercased()))…")
@@ -147,6 +273,8 @@ struct GenerateCommand: AsyncParsableCommand {
         }
 
         var request = H3GenerationRequest(prompt: finalPrompt)
+        request.references = decodedReferences
+        decodedReferences = []  // hand over, do not keep a second copy of the source frames alive
         if let image {
             request.image = try H3KeyframeImage.load(from: URL(fileURLWithPath: image))
         }

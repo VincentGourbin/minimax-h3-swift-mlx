@@ -13,7 +13,7 @@ struct ExportQuantizedCommand: AsyncParsableCommand {
             + "so later loads read the small file directly."
     )
 
-    @Argument(help: "Component: transformer | text-encoder | all")
+    @Argument(help: "Component: transformer | transformer-ref | text-encoder | all")
     var component: String = "all"
 
     @Option(name: .long, help: "Quantization: qint8 | qint6 | int4.")
@@ -41,14 +41,19 @@ struct ExportQuantizedCommand: AsyncParsableCommand {
             print(String(format: "  done in %.1f s", Date().timeIntervalSince(start)))
             Memory.clearCache()
         }
-        if all || component == "transformer" {
-            print("Quantizing transformer (\(quantization.rawValue))…")
+        // `transformer_ref` is the `ref2va` partition. Its config is byte-identical to the main
+        // transformer's, so the same loader and the same quantization filter apply — but it is a
+        // second 61.7 GB read and a second ~18.5 GB export, so `all` does not sweep it up.
+        for (name, directoryName) in [("transformer", "transformer"), ("transformer-ref", "transformer_ref")]
+        where (all && name == "transformer") || component == name {
+            print("Quantizing \(directoryName) (\(quantization.rawValue))…")
             let start = Date()
             let model = try H3WeightLoader.loadTransformer(
-                modelDirectory: directory, quantization: quantization, skipPrequantizedPickup: true)
+                modelDirectory: directory, quantization: quantization, skipPrequantizedPickup: true,
+                component: directoryName)
             try H3WeightLoader.exportQuantized(
                 model: model, modelDirectory: directory,
-                component: "transformer", quantization: quantization)
+                component: directoryName, quantization: quantization)
             print(String(format: "  done in %.1f s", Date().timeIntervalSince(start)))
             Memory.clearCache()
         }

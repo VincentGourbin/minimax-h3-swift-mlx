@@ -16,7 +16,27 @@ import MLXLMCommon
 import MLXRandom
 
 public enum H3EnhanceVariant: String, Sendable {
-    case t2va, i2va, fl2va, l2va
+    case t2va, i2va, fl2va, l2va, ref2va
+
+    /// The section the rewrite must open with. `ref2va` takes six sections of its own instead of
+    /// the three-field Context-IR the other four modes share.
+    var leadSection: String {
+        self == .ref2va ? "subject_definitions:" : "integrated_multimodal_description:"
+    }
+}
+
+/// One `ref2va` reference as the rewriter sees it: the label MiniMax-H3 will resolve it under,
+/// and what the analyzer saw in it.
+public struct H3ReferenceAnalysis: Sendable {
+    /// `"<Picture 1>"`, `"<Video 2>"`, `"<Audio 1>"` — numbered per modality in request order,
+    /// exactly as the presentation numbers them.
+    public var label: String
+    public var analysis: String
+
+    public init(label: String, analysis: String) {
+        self.label = label
+        self.analysis = analysis
+    }
 }
 
 public actor MultimodalContextIR {
@@ -111,7 +131,8 @@ public actor MultimodalContextIR {
         imageAnalysis: String? = nil,
         lastImageAnalysis: String? = nil,
         audioAnalysis: String? = nil,
-        videoAnalysis: String? = nil
+        videoAnalysis: String? = nil,
+        referenceAnalyses: [H3ReferenceAnalysis] = []
     ) async throws -> String {
         var sections = [String]()
         sections.append("Target video duration: \(String(format: "%.2f", durationSeconds)) seconds.")
@@ -133,6 +154,17 @@ public actor MultimodalContextIR {
                 "Analysis of the reference video (use it as structural inspiration — shots, "
                     + "camera, pacing):\n\(videoAnalysis)")
         }
+        for reference in referenceAnalyses {
+            sections.append("Analysis of \(reference.label):\n\(reference.analysis)")
+        }
+        if !referenceAnalyses.isEmpty {
+            // The labels are the contract between the prompt and the packed sequence: the
+            // presentation numbers them per modality in request order, and a label the rewrite
+            // invents (or renumbers) points at conditioning that is not there.
+            sections.append(
+                "Reference labels available, and the ONLY ones you may use: "
+                    + referenceAnalyses.map(\.label).joined(separator: ", ") + ".")
+        }
         sections.append("User request: \(request)")
 
         let raw = try await generate(
@@ -141,7 +173,7 @@ public actor MultimodalContextIR {
             maxTokens: 900
         )
         var cleaned = ContextIREnhancer.stripDecorations(raw)
-        guard let core = cleaned.range(of: "integrated_multimodal_description:") else {
+        guard let core = cleaned.range(of: variant.leadSection) else {
             throw Failure.malformedOutput(raw)
         }
         // The alignment line is a fixed contract — impose it deterministically instead of
@@ -169,6 +201,10 @@ public actor MultimodalContextIR {
         case .l2va:
             return "How the reference pictures align with the target video — <Picture 1> (from "
                 + "[Shot 1]) aligns with the \(duration)-second mark of the target video."
+        case .ref2va:
+            // No keyframe, so no alignment line: `subject_definitions` opens the rewrite and the
+            // reference relationships are stated in `retention_analysis` instead.
+            return nil
         }
     }
 
@@ -208,6 +244,60 @@ public actor MultimodalContextIR {
                 Then one blank line, then the three core fields. Infer a plausible earlier \
                 state, then converge: preceding state, explicit transition path, gradual \
                 convergence, last-frame landing on the <Picture 1> state.
+                """
+        case .ref2va:
+            // Full-reference mode takes SIX sections of its own, in this order — the format
+            // MiniMax documents in `VIDEO_PROMPT_WRITING_GUIDE_ref_en.md`. It replaces the
+            // three-field Context-IR entirely rather than extending it.
+            prompt = """
+                You rewrite a user's request into MiniMax-H3's full-reference (Ref2VA) format.
+                Output ONLY the rewrite, in English, with exactly these six sections in this \
+                order, each on its own line and separated by a blank line:
+
+                subject_definitions:
+                summary:
+                retention_analysis:
+                detailed_description:
+                overall_soundscape:
+                non_diegetic_music:
+
+                subject_definitions: one line per tracked item. Introduce `<Subject N>` for each \
+                person, animal, environment or object that has to stay consistent, and say which \
+                reference label it comes from — "<Subject 1> is the ... in <Picture 1>, featuring \
+                ...". An `<Audio N>` that is only a voice or music reference gets its own line \
+                stating what it provides. A reference label cited only to source another item \
+                needs no line of its own.
+
+                summary: one short paragraph opening with a square-bracketed task-type prefix \
+                built from the roles the references actually play — `reference generation`, \
+                `video editing`, `video continuation`, `audio reuse`, `audio reference`, \
+                `keyframe completion` — e.g. "[reference generation + audio reference]".
+
+                retention_analysis: one line per reference label, naming the shots it appears in \
+                and its relationship — `fully_preserved`, `partially_preserved`, `transferred`, \
+                `reused` or `reference` — followed by " - " and what is retained. Never write a \
+                speaker id here.
+
+                detailed_description: the playback-order description, 350-500 words, in \
+                `[Shot N]` blocks with `At 00:MM.mmm` timecodes on every shot after the first. \
+                Establish composition, appearance, environment, lighting, action, camera move \
+                and sound in each shot, and cite the reference labels where their content \
+                actually appears. Assign a speaker id `(Sx)` at the first vocal event of each \
+                distinct voice, in order, and reuse it at every later line by that voice. Write \
+                dialogue and lyrics ONLY here, inside `<d>[Language] ...</d>`, in their original \
+                language.
+
+                overall_soundscape: ambience and physical sound across the whole video, with \
+                explicit loudness words. No dialogue text.
+
+                non_diegetic_music: audience-only score — instrumentation, tempo, development — \
+                or `N/A` when there is none.
+
+                A duration of \(duration) seconds is the target; the described timeline must fit \
+                it. Use ONLY the reference labels you were given, keep each label's meaning \
+                identical across all six sections, and never invent a label. Describe concretely: \
+                no plot summaries, no unresolved labels, no abstract adjectives standing in for \
+                description.
                 """
         }
         return prompt

@@ -159,10 +159,19 @@ public struct Qwen3VLMultimodalLayout {
     public let imageRuns: [(start: Int, count: Int)]
 
     /// Port of transformers' `Qwen3VLModel.get_rope_index` for a single unpadded sequence.
+    ///
+    /// Video runs need no separate branch: `get_rope_index` splits a `video_grid_thw` into one
+    /// `(1, h, w)` entry per temporal group before laying anything out, and Qwen3-VL labels its
+    /// groups with `"<t seconds>"` text between them, so every vision run this sees is one
+    /// single-frame grid whatever modality produced it.
+    ///
     /// - Parameters:
-    ///   - mmTokenTypes: 0 for text, 1 for `<|image_pad|>` — the processor convention; the
-    ///     vision start/end delimiters are *text* here even though H3 tags them as video rows.
-    ///   - imageGrids: per image, the (gridH, gridW) patch grid BEFORE spatial merge.
+    ///   - mmTokenTypes: 0 for text, 1 for `<|image_pad|>`, 2 for `<|video_pad|>` — the processor
+    ///     convention; the vision start/end delimiters are *text* here even though H3 tags them as
+    ///     video rows. Only zero/non-zero matters to the layout; the two vision values are kept
+    ///     apart so that two adjacent runs of different modalities stay two runs.
+    ///   - imageGrids: per vision RUN, in presentation order, the (gridH, gridW) patch grid BEFORE
+    ///     spatial merge.
     public init(mmTokenTypes: [Int32], imageGrids: [(h: Int, w: Int)], mergeSize: Int = 2) throws {
         var t = [Int32](), h = [Int32](), w = [Int32]()
         t.reserveCapacity(mmTokenTypes.count)
@@ -184,14 +193,14 @@ public struct Qwen3VLMultimodalLayout {
                 currentPosition += Int32(end - index)
             } else {
                 guard nextImage < imageGrids.count else {
-                    throw H3Error.invalidInput("More image-token runs than image grids.")
+                    throw H3Error.invalidInput("More vision-token runs than vision grids.")
                 }
                 let grid = imageGrids[nextImage]
                 nextImage += 1
                 let (mergedH, mergedW) = (grid.h / mergeSize, grid.w / mergeSize)
                 guard end - index == mergedH * mergedW else {
                     throw H3Error.invalidInput(
-                        "Image run of \(end - index) tokens does not match grid "
+                        "Vision run of \(end - index) tokens does not match grid "
                             + "\(grid.h)x\(grid.w) (\(mergedH * mergedW) merged tokens).")
                 }
                 runs.append((index, end - index))
@@ -208,7 +217,7 @@ public struct Qwen3VLMultimodalLayout {
             index = end
         }
         guard nextImage == imageGrids.count else {
-            throw H3Error.invalidInput("\(imageGrids.count - nextImage) image grids without token runs.")
+            throw H3Error.invalidInput("\(imageGrids.count - nextImage) vision grids without token runs.")
         }
         positions = MLXArray(t + h + w, [3, mmTokenTypes.count])
         imageRuns = runs
@@ -275,6 +284,10 @@ public final class Qwen3VLTextEncoder: Module {
             positions: layout?.positions, sequenceLength: tokenIds.dim(1))
         x = x.expandedDimensions(axis: 0)
         var captured = [Int: MLXArray]()
+        // Depth 0 is the embedding stream itself, vision features injected and no layer run —
+        // transformers' `hidden_states[0]`. It is what separates a conditioning-input bug from a
+        // text-stack one, so the harness can ask for it.
+        if captureDepths.contains(0) { captured[0] = x }
         for (index, layer) in layers.enumerated() {
             x = layer(x, cos: cos, sin: sin)
             if index < deepstack.count, let layout {

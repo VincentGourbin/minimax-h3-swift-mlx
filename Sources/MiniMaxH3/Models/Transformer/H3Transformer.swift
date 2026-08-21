@@ -565,15 +565,24 @@ public final class H3Transformer: Module {
         textStream = tokenRefiner(textStream)
         let streamType = textStream.dtype
 
-        // 2. Assemble the packed sequence. The t2va/fl2va layout is contiguous
-        // [text | condition video | audio | target video], so concatenation reproduces the
-        // reference's index_copy scatter exactly.
+        // 2. Assemble the packed sequence, reproducing the reference's `index_copy` scatter.
+        // The t2va/fl2va layout is contiguous — [text | condition video | audio | target video] —
+        // so concatenating in that order IS the scatter. A `ref2va` layout interleaves one block
+        // per reference in request order, so it carries a gather that puts the same three streams
+        // where they belong.
         let conditionRows = layout.numConditionVideoRows
-        var pieces: [MLXArray] = [textStream[0]]
-        if conditionRows > 0 { pieces.append(videoEmbeds[..<conditionRows].asType(streamType)) }
-        pieces.append(audioEmbeds.asType(streamType))
-        pieces.append(videoEmbeds[conditionRows...].asType(streamType))
-        var x = concatenated(pieces, axis: 0).expandedDimensions(axis: 0)  // (1, seq, hidden)
+        var x: MLXArray
+        if let order = layout.packedGatherOrder {
+            x = concatenated(
+                [textStream[0], videoEmbeds.asType(streamType), audioEmbeds.asType(streamType)],
+                axis: 0)[order].expandedDimensions(axis: 0)
+        } else {
+            var pieces: [MLXArray] = [textStream[0]]
+            if conditionRows > 0 { pieces.append(videoEmbeds[..<conditionRows].asType(streamType)) }
+            pieces.append(audioEmbeds.asType(streamType))
+            pieces.append(videoEmbeds[conditionRows...].asType(streamType))
+            x = concatenated(pieces, axis: 0).expandedDimensions(axis: 0)  // (1, seq, hidden)
+        }
 
         // 3. One timestep embedding per distinct noise level, float32, shared by every AdaLN.
         let temb = timeEmbedder(MLXArray(timesteps))
@@ -596,6 +605,11 @@ public final class H3Transformer: Module {
         let videoOut = projOut(x)[0]
         let audioOut = audioProjOut(x)[0]
 
+        if layout.packedGatherOrder != nil {
+            // Interleaved layout: the rows of each modality are wherever their block put them, and
+            // the gather orders already list them conditioning-rows-first.
+            return (videoOut[layout.videoIndices], audioOut[layout.audioIndices])
+        }
         let textCount = layout.numTextTokens
         let audioStart = textCount + conditionRows
         let videoStart = audioStart + layout.numAudioRows
